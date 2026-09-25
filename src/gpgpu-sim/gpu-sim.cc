@@ -1470,6 +1470,10 @@ void gpgpu_sim::update_stats() {
   partiton_reqs_in_parallel_util = 0;
   gpu_sim_cycle_parition_util = 0;
   gpu_sim_insn = 0;
+  // Reset with gpu_sim_insn: otherwise the deadlock check compares this
+  // kernel's count against a stale value from an earlier kernel and can fire
+  // falsely when two identical kernels reach the same count at a check cycle.
+  last_gpu_sim_insn = 0;
   m_total_cta_launched = 0;
   gpu_completed_cta = 0;
   gpu_occupancy = occupancy_stats();
