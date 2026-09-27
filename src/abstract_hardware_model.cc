@@ -314,6 +314,7 @@ void warp_inst_t::generate_mem_accesses() {
       break;
     case global_space:
       access_type = is_write ? GLOBAL_ACC_W : GLOBAL_ACC_R;
+      if (is_cam_mem()) access_type = is_write ? CAM_ACC_W : CAM_ACC_R;
       break;
     case local_space:
     case param_space_local:

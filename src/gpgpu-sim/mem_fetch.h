@@ -89,6 +89,17 @@ class mem_fetch {
 
   void set_write_interchip(uint32_t dest_chiplet);
 
+  // CAM extension: per-request state. Kept here, not in the (shared)
+  // warp_inst_t. Result packets of one search are separate mem_fetch
+  // fragments carrying frag/nfrag; the last one completes the request.
+  struct cam_info_t {
+    bool valid = false;
+    unsigned frag = 0, nfrag = 1;   // result packet index / count
+    unsigned long long req_id = 0;  // unit-assigned search id (result log)
+    unsigned long long t_arrive = 0, t_admit = 0, t_first = 0;
+  } m_cam;
+  std::shared_ptr<warp_inst_t> get_inst_ptr() const { return m_inst; }
+
   const addrdec_t &get_tlx_addr() const { return m_raw_addr; }
   void set_chip(unsigned chip_id) { m_raw_addr.chip = chip_id; }
   void set_partition(unsigned sub_partition_id) {

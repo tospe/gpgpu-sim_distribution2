@@ -31,6 +31,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include "gpu-sim.h"
+#include "cam.h"
 
 #include <execinfo.h>
 #include <math.h>
@@ -313,6 +314,50 @@ void memory_config::reg_options(class OptionParser *opp) {
       "4:2:8:12:21:13:34:9:4:5:13:1:0:0");
   option_parser_register(opp, "-gpgpu_l2_rop_latency", OPT_UINT32, &rop_latency,
                          "ROP queue latency (default 85)", "85");
+  option_parser_register(opp, "-gpgpu_cam_enabled", OPT_BOOL, &cam_enabled,
+                         "CAM extension enabled", "0");
+  option_parser_register(opp, "-gpgpu_cam_num_rows", OPT_UINT32, &cam_num_rows,
+                         "CAM capacity in rows (hypothetical)", "32768");
+  option_parser_register(
+      opp, "-gpgpu_cam_search_latency_dsa", OPT_UINT32, &cam_search_latency,
+      "CAM search latency L, core cycles (hypothetical)", "200");
+  option_parser_register(
+      opp, "-gpgpu_cam_search_ii", OPT_UINT32, &cam_search_ii,
+      "CAM cycles between search starts (hypothetical)", "8");
+  option_parser_register(opp, "-gpgpu_cam_topk_latency", OPT_UINT32,
+                         &cam_topk_latency,
+                         "CAM readout cycles per result (hypothetical)", "1");
+  option_parser_register(opp, "-gpgpu_cam_result_entry_bytes", OPT_UINT32,
+                         &cam_result_entry_bytes,
+                         "CAM bytes per result entry (id + score)", "8");
+  option_parser_register(opp, "-gpgpu_cam_result_pkt_bytes", OPT_UINT32,
+                         &cam_result_pkt_bytes, "CAM result packet bytes",
+                         "128");
+  option_parser_register(opp, "-gpgpu_cam_max_outstanding", OPT_UINT32,
+                         &cam_max_outstanding,
+                         "CAM searches in service per unit", "16");
+  option_parser_register(opp, "-gpgpu_cam_warp_max_outstanding", OPT_UINT32,
+                         &cam_warp_max_outstanding,
+                         "CAM in-flight searches per warp", "4");
+  option_parser_register(opp, "-gpgpu_cam_slots", OPT_UINT32, &cam_slots,
+                         "CAM completion slots per CTA", "8");
+  option_parser_register(opp, "-gpgpu_cam_query_bytes", OPT_UINT32,
+                         &cam_query_bytes,
+                         "CAM query bytes staged before admission", "16640");
+  option_parser_register(opp, "-gpgpu_cam_write_latency", OPT_UINT32,
+                         &cam_write_latency, "CAM row write cycles", "4");
+  option_parser_register(opp, "-gpgpu_cam_fill_setup_latency", OPT_UINT32,
+                         &cam_fill_setup_latency, "CAM fill setup cycles", "0");
+  option_parser_register(opp, "-gpgpu_cam_fill_row_latency", OPT_UINT32,
+                         &cam_fill_row_latency, "CAM fill cycles per row",
+                         "21");
+  option_parser_register(opp, "-gpgpu_cam_input_queue", OPT_UINT32,
+                         &cam_input_queue, "CAM unit input queue entries",
+                         "64");
+  option_parser_register(opp, "-gpgpu_cam_func_file", OPT_CSTR, &cam_func_file,
+                         "CAM functional data file (keys, queries)", "");
+  option_parser_register(opp, "-gpgpu_cam_result_log", OPT_CSTR,
+                         &cam_result_log, "CAM per-request result log", "");
   option_parser_register(opp, "-dram_latency", OPT_UINT32, &dram_latency,
                          "DRAM latency (default 30)", "30");
   option_parser_register(opp, "-dram_dual_bus_interface", OPT_UINT32,
@@ -1124,6 +1169,10 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
           m_memory_config->inter_chiplet_queue_latency, gpu_sim_cycle,
           gpu_tot_sim_cycle));
     }
+    if (m_memory_config->cam_enabled) {  // before the units that use them
+      m_cam_func = new cam_functional(m_memory_config->cam_func_file);
+      m_cam_log = new cam_log(m_memory_config->cam_result_log);
+    }
     for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
       m_memory_partition_unit[i] = new memory_partition_unit(
           i, m_memory_config, m_memory_stats, this, m_request_0_to_1,
@@ -1825,6 +1874,12 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
   m_memory_stats->print_interchip_stats();
   for (unsigned i = 0; i < m_memory_config->m_n_mem; i++)
     m_memory_partition_unit[i]->print(stdout);
+  // CAM extension: per-unit statistics (units that saw traffic)
+  if (m_memory_config->cam_enabled) {
+    for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++)
+      m_memory_sub_partition[i]->cam_print_stats(stdout);
+    if (m_cam_log && m_cam_log->on()) fflush(m_cam_log->fp());
+  }
 
   // L2 cache stats
   if (!m_memory_config->m_L2_config.disabled()) {
@@ -2257,6 +2312,16 @@ void gpgpu_sim::cycle() {
   if (clock_mask & L2) {
     // pop from L2 to interconnect
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+      // CAM extension: CAM replies go straight back to the SM
+      if (m_memory_config->cam_enabled) {
+        mem_fetch *cam_mf = m_memory_sub_partition[i]->cam_top(
+            gpu_sim_cycle + gpu_tot_sim_cycle);
+        if (cam_mf &&
+            handle_mf_reply(i, cam_mf, partiton_replys_in_parallel_per_cycle)) {
+          m_memory_sub_partition[i]->cam_pop();
+          continue;  // one reply per sub-partition per cycle
+        }
+      }
       // The mf that gets send down to L2
       mem_fetch *base_mf = m_memory_sub_partition[i]->top();
       if (base_mf) {
@@ -2342,6 +2407,8 @@ void gpgpu_sim::cycle() {
       }
 
       m_memory_sub_partition[i]->cache_cycle(global_cycle());
+      if (m_memory_config->cam_enabled)
+        m_memory_sub_partition[i]->cam_cycle(gpu_sim_cycle + gpu_tot_sim_cycle);
 
       if (m_config.g_power_simulation_enabled) {
         m_memory_sub_partition[i]->accumulate_L2cache_stats(

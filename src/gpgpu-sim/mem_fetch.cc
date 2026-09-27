@@ -79,6 +79,12 @@ mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
     m_partition_addr =
         config->m_address_mapping.partition_address(access.get_addr());
   }
+  if (access.get_type() == CAM_ACC_R || access.get_type() == CAM_ACC_W) {
+    // CAM: one logical unit per array. Decode as if issued from TPC 0 so every
+    // SM reaches the same (home) sub-partition regardless of chiplet folding.
+    config->m_address_mapping.addrdec_tlx(access.get_addr(), &m_raw_addr, 0);
+    m_cam.valid = true;
+  }
   if (config->n_chiplet > 1) {
     m_dest_chiplet = config->get_dest_chiplet(access.get_addr());
     m_src_chiplet = config->get_src_chiplet(tpc);
@@ -125,6 +131,12 @@ mem_fetch::mem_fetch(const mem_access_t &access,
     config->m_address_mapping.addrdec_tlx(access.get_addr(), &m_raw_addr, tpc);
     m_partition_addr =
         config->m_address_mapping.partition_address(access.get_addr());
+  }
+  if (access.get_type() == CAM_ACC_R || access.get_type() == CAM_ACC_W) {
+    // CAM: one logical unit per array. Decode as if issued from TPC 0 so every
+    // SM reaches the same (home) sub-partition regardless of chiplet folding.
+    config->m_address_mapping.addrdec_tlx(access.get_addr(), &m_raw_addr, 0);
+    m_cam.valid = true;
   }
   if (config->n_chiplet > 1) {
     m_dest_chiplet = config->get_dest_chiplet(access.get_addr());

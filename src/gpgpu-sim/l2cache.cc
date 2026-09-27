@@ -41,6 +41,7 @@
 #include "../option_parser.h"
 #include "../statwrapper.h"
 #include "basic_components.h"
+#include "cam.h"
 #include "dram.h"
 #include "gpu-cache.h"
 #include "gpu-sim.h"
@@ -460,6 +461,9 @@ memory_sub_partition::memory_sub_partition(
   m_gpu = gpu;
   m_memcpy_cycle_offset = 0;
   m_chiplet_id = sub_partition_id / config->m_n_sub_partition_per_chiplet;
+  if (config->cam_enabled)
+    m_cam = new cam_unit(config, sub_partition_id, gpu->get_cam_functional(),
+                         gpu->get_cam_log());
   uint32_t local_sub_partition_id =
       sub_partition_id % config->m_n_sub_partition_per_chiplet;
   m_chiplet_icnt.init(m_chiplet_id, local_sub_partition_id, request_0_to_1,
@@ -699,13 +703,31 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
   }
 }
 
-bool memory_sub_partition::full() const { return m_icnt_L2_queue->full(); }
+bool memory_sub_partition::full() const {
+  return m_icnt_L2_queue->full() || (m_cam && m_cam->full());
+}
+
+void memory_sub_partition::cam_cycle(unsigned long long now) {
+  if (m_cam) m_cam->cycle(now);
+}
+mem_fetch *memory_sub_partition::cam_top(unsigned long long now) {
+  return m_cam ? m_cam->top(now) : NULL;
+}
+void memory_sub_partition::cam_pop() { m_cam->pop(); }
+void memory_sub_partition::cam_print_stats(FILE *fp) const {
+  if (m_cam && (m_cam->n_searches || m_cam->n_fills || m_cam->n_writes ||
+                m_cam->n_qpush))
+    m_cam->print_stats(fp);
+}
 
 bool memory_sub_partition::lrc_full() const {
   return m_lrc != nullptr && m_lrc->full();
 }
 
 bool memory_sub_partition::full(unsigned size) const {
+  // CAM extension: a full CAM input queue backpressures this sub-partition's
+  // input port (head-of-line for all traffic to it; documented limitation)
+  if (m_cam && m_cam->full()) return true;
   return m_icnt_L2_queue->is_avilable_size(size);
 }
 
@@ -895,6 +917,14 @@ memory_sub_partition::breakdown_request_to_sector_requests(mem_fetch *mf) {
 }
 
 void memory_sub_partition::push(mem_fetch *m_req, unsigned long long cycle) {
+  if (m_req && m_req->m_cam.valid) {
+    // CAM extension: CAM requests go to the CAM unit, bypassing the ROP
+    // queue, sector breakdown and LRC (the CAM is not a cache).
+    assert(m_cam);
+    m_stats->memlatstat_icnt2mem_pop(m_req);
+    m_cam->push(m_req, m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+    return;
+  }
   if (m_req) {
     m_stats->memlatstat_icnt2mem_pop(m_req);
     std::vector<mem_fetch *> reqs;

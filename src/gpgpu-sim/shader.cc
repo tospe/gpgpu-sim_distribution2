@@ -42,6 +42,7 @@
 #include "../cuda-sim/ptx_sim.h"
 #include "../statwrapper.h"
 #include "addrdec.h"
+#include "cam.h"
 #include "dram.h"
 #include "gpu-misc.h"
 #include "gpu-sim.h"
@@ -546,6 +547,15 @@ void shader_core_ctx::init_warps(unsigned cta_id, unsigned start_thread,
                                  int cta_size, kernel_info_t &kernel) {
   address_type start_pc = next_pc(start_thread);
   unsigned kernel_id = kernel.get_uid();
+  // CAM extension: fresh completion-slot counters for this hardware CTA
+  if (m_cam_done.size() < MAX_CTA_PER_SHADER) {
+    m_cam_done.resize(MAX_CTA_PER_SHADER);
+    m_cam_free.resize(MAX_CTA_PER_SHADER);
+    m_cam_first_warp.resize(MAX_CTA_PER_SHADER, 0);
+  }
+  m_cam_done[cta_id].assign(m_memory_config->cam_slots, 0);
+  m_cam_free[cta_id].assign(m_memory_config->cam_slots, 0);
+  m_cam_first_warp[cta_id] = start_thread / m_config->warp_size;
   if (m_config->model == POST_DOMINATOR) {
     unsigned start_warp = start_thread / m_config->warp_size;
     unsigned warp_per_cta = cta_size / m_config->warp_size;
@@ -1069,6 +1079,7 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
       m_warp[warp_id]->get_streamID());  // dynamic instruction information
   m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
   func_exec_inst(**pipe_reg);
+  if ((*pipe_reg)->is_cam()) cam_issue(warp_id, **pipe_reg);
 
   // Add LDGSTS instructions into a buffer
   unsigned int ldgdepbar_id = m_warp[warp_id]->m_ldgdepbar_id;
@@ -1570,6 +1581,13 @@ void scheduler_unit::cycle() {
                                       m_id) &&
                   (!diff_exec_units ||
                    previous_issued_inst_exec_type != exec_unit_type_t::MEM)) {
+                // CAM: a search needs a free per-warp outstanding slot
+                if (pI->m_cam_op == CAM_OP_SEARCH &&
+                    m_shader->cam_mem_config()->cam_warp_max_outstanding &&
+                    m_shader->cam_warp_outstanding(warp_id) >=
+                        m_shader->cam_mem_config()->cam_warp_max_outstanding) {
+                  break;
+                }
                 // Check TRYWAIT before issuing - if not ready, skip issue
                 if (pI->is_syncs_try_wait() &&
                     !m_shader->check_trywait_ready(pI, warp_id)) {
@@ -2571,7 +2589,7 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
             if (inst.out[r] > 0)
               assert(m_pending_writes[inst.warp_id()][inst.out[r]] > 0);
           if (access.is_tma()) m_core->inc_tma_load_req(inst.warp_id());
-        } else if (inst.is_store())
+        } else if (inst.is_store() && inst.m_cam_op != CAM_OP_QPUSH)
           m_core->inc_store_req(inst.warp_id());
       }
     }
@@ -3077,6 +3095,15 @@ void ldst_unit::writeback() {
         assert(m_next_global.size() <= m_config->m_L1D_config.l1_banks);
         while (!m_next_global.empty()) {
           mem_fetch *mf = m_next_global.front();
+          if (mf->m_cam.valid) {
+            // CAM reply: result bytes land in the CTA result buffer; only the
+            // last packet completes the request (no register writeback).
+            if (mf->m_cam.frag + 1 == mf->m_cam.nfrag) m_core->cam_complete(mf);
+            m_next_global.pop_front();
+            delete mf;
+            serviced_client = next_client;
+            continue;
+          }
           m_next_wb = mf->get_inst();
           if (m_operand_collector->writeback(m_next_wb)) {
             if (mf->isatomic()) {
@@ -5014,9 +5041,97 @@ bool shd_warp_t::functional_done() const {
   return get_n_completed() == m_warp_size;
 }
 
+// ---------------------------------------------------------------- CAM
+// Issue-time effects of CAM instructions (the pipeline copy is per dynamic
+// instance, so stamping it is safe; mem_fetch copies it).
+void shader_core_ctx::cam_issue(unsigned warp_id, warp_inst_t &inst) {
+  shd_warp_t *w = m_warp[warp_id];
+  const unsigned cta = w->get_cta_id();
+  assert(m_memory_config->cam_enabled && "CAM instruction with CAM disabled");
+  inst.m_cam_warp_in_cta = warp_id - m_cam_first_warp[cta];
+  if (inst.active_count() == 0) return;  // predicated off: no effect
+  const unsigned long long now =
+      m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
+  if (inst.m_cam_slot >= m_memory_config->cam_slots) {
+    fprintf(stderr, "GPGPU-Sim CAM: slot %u >= -gpgpu_cam_slots %u\n",
+            inst.m_cam_slot, m_memory_config->cam_slots);
+    abort();
+  }
+  switch (inst.m_cam_op) {
+    case CAM_OP_SEARCH:
+      inst.m_cam_seq = w->m_cam_seq++;
+      w->m_cam_outstanding++;
+      break;
+    case CAM_OP_FILL:
+    case CAM_OP_WRITE:
+      w->m_cam_outstanding++;
+      break;
+    case CAM_OP_WAIT:
+    case CAM_OP_WAITF:
+      w->m_cam_wait_kind = inst.m_cam_op == CAM_OP_WAIT ? 1 : 2;
+      w->m_cam_wait_slot = inst.m_cam_slot;
+      w->m_cam_wait_count = inst.m_cam_count;
+      w->m_cam_wait_issue = now;
+      break;
+    case CAM_OP_REL:
+      m_cam_free[cta][inst.m_cam_slot]++;
+      break;
+    default:
+      break;
+  }
+}
+
+unsigned shader_core_ctx::cam_warp_outstanding(unsigned warp_id) const {
+  return m_warp[warp_id]->m_cam_outstanding;
+}
+
+// The last reply of a CAM request reached LDST writeback: the request is
+// complete and its result (if any) is consumable from now on.
+void shader_core_ctx::cam_complete(mem_fetch *mf) {
+  const unsigned wid = mf->get_wid();
+  shd_warp_t *w = m_warp[wid];
+  const warp_inst_t &inst = mf->get_inst();
+  const unsigned cta = w->get_cta_id();
+  const unsigned long long now =
+      m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
+  assert(w->m_cam_outstanding > 0);
+  w->m_cam_outstanding--;
+  m_cam_done[cta][inst.m_cam_slot]++;
+  cam_log *log = m_gpu->get_cam_log();
+  if (!log || !log->on()) return;
+  if (inst.m_cam_op == CAM_OP_SEARCH) {
+    std::vector<std::pair<int, float>> res;
+    log->take(mf->m_cam.req_id, res);
+    fprintf(log->fp(), "S,%llu,%u,%u,%u,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%zu",
+            mf->m_cam.req_id, m_sid, wid, inst.get_cuda_cta_id().x,
+            inst.m_cam_warp_in_cta, inst.m_cam_seq, inst.m_cam_slot,
+            (unsigned long long)inst.get_issue_cycle(), mf->m_cam.t_arrive,
+            mf->m_cam.t_admit, mf->m_cam.t_first, now, res.size());
+    for (auto &r : res) fprintf(log->fp(), ",%d", r.first);
+    for (auto &r : res) fprintf(log->fp(), ",%.9g", r.second);
+    fprintf(log->fp(), "\n");
+  } else {
+    fprintf(log->fp(), "F,%u,%u,%u,%u,%u,%llu,%llu,%llu\n", m_sid, wid,
+            inst.m_cam_slot, inst.m_cam_row,
+            inst.m_cam_op == CAM_OP_FILL ? inst.m_cam_rows : 1,
+            (unsigned long long)inst.get_issue_cycle(), mf->m_cam.t_arrive,
+            now);
+  }
+}
+
+void shader_core_ctx::cam_log_wait(unsigned warp_id, unsigned kind,
+                                   unsigned slot, unsigned count,
+                                   unsigned long long t_issue) {
+  cam_log *log = m_gpu->get_cam_log();
+  if (!log || !log->on()) return;
+  fprintf(log->fp(), "W,%u,%u,%s,%u,%u,%llu,%llu\n", m_sid, warp_id,
+          kind == 1 ? "done" : "free", slot, count, t_issue,
+          m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+}
+
 bool shd_warp_t::hardware_done() const {
   return functional_done() && stores_done() && tma_loads_done() &&
-         !inst_in_pipeline();
+         !inst_in_pipeline() && m_cam_outstanding == 0;
 }
 
 bool shd_warp_t::waiting() {
@@ -5035,6 +5150,18 @@ bool shd_warp_t::waiting() {
   waiting |= (m_n_atomic > 0);
   // Waiting for LDGSTS to finish
   waiting |= m_waiting_ldgsts;
+  // CAM extension: CAMWAIT / CAMWAITF on a per-CTA completion slot counter.
+  // Re-evaluated every cycle against the counter; no polling traffic.
+  if (m_cam_wait_kind) {
+    if (m_shader->cam_counter(m_cta_id, m_cam_wait_kind, m_cam_wait_slot) >=
+        m_cam_wait_count) {
+      m_shader->cam_log_wait(m_warp_id, m_cam_wait_kind, m_cam_wait_slot,
+                             m_cam_wait_count, m_cam_wait_issue);
+      m_cam_wait_kind = 0;
+    } else {
+      waiting = true;
+    }
+  }
   // Waiting for TMA store bulk group to finish
   if (m_waiting_tma_bulk_group) {
     // Check if we should still wait for the TMA store bulk group
@@ -5646,6 +5773,13 @@ void simt_core_cluster::update_icnt_stats(class mem_fetch *mf) {
       break;
     case INST_ACC_R:
       m_stats->gpgpu_n_mem_read_inst++;
+      break;
+    // CAM extension: CAM traffic counted as global traffic at the icnt level
+    case CAM_ACC_R:
+      m_stats->gpgpu_n_mem_read_global++;
+      break;
+    case CAM_ACC_W:
+      m_stats->gpgpu_n_mem_write_global++;
       break;
     case L1_WRBK_ACC:
       m_stats->gpgpu_n_mem_write_global++;

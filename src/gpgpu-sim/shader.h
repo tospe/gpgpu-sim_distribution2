@@ -160,6 +160,12 @@ class shd_warp_t {
 
     // NANOSLEEP support
     m_nanosleep_until = 0;
+    m_cam_outstanding = 0;
+    m_cam_seq = 0;
+    m_cam_wait_kind = 0;
+    m_cam_wait_slot = 0;
+    m_cam_wait_count = 0;
+    m_cam_wait_issue = 0;
 
     // TRYWAIT retry support
     m_trywait_retries = 0;
@@ -212,6 +218,12 @@ class shd_warp_t {
 
     // NANOSLEEP support
     m_nanosleep_until = 0;
+    m_cam_outstanding = 0;
+    m_cam_seq = 0;
+    m_cam_wait_kind = 0;
+    m_cam_wait_slot = 0;
+    m_cam_wait_count = 0;
+    m_cam_wait_issue = 0;
 
     // TRYWAIT retry support
     m_trywait_retries = 0;
@@ -288,6 +300,14 @@ class shd_warp_t {
   // NANOSLEEP support
   void set_nanosleep(uint64_t wake_cycle) { m_nanosleep_until = wake_cycle; }
   void clear_nanosleep() { m_nanosleep_until = 0; }
+  // CAM extension: in-flight CAM requests (searches, fills, writes) of this
+  // warp; a warp cannot finish while any are outstanding.
+  unsigned m_cam_outstanding;
+  unsigned m_cam_seq;        // next search sequence number of this warp
+  unsigned m_cam_wait_kind;  // 0 none, 1 CAMWAIT (done), 2 CAMWAITF (free)
+  unsigned m_cam_wait_slot;
+  unsigned m_cam_wait_count;
+  unsigned long long m_cam_wait_issue;
   bool is_nanosleeping(uint64_t current_cycle) const {
     return m_nanosleep_until > 0 && current_cycle < m_nanosleep_until;
   }
@@ -2792,6 +2812,21 @@ class shader_core_ctx : public core_t {
     m_warp[warp_id]->dec_inst_in_pipeline();
   }  // also used in writeback()
   void store_ack(class mem_fetch *mf);
+  // CAM extension (docs/h100_cam_protocol.md §6): per-CTA monotonic slot
+  // counters done[] (CAM completions) and free[] (CAMREL releases).
+  unsigned long long cam_counter(unsigned cta, unsigned kind,
+                                 unsigned slot) const {
+    const auto &v = (kind == 1) ? m_cam_done[cta] : m_cam_free[cta];
+    return slot < v.size() ? v[slot] : 0;
+  }
+  void cam_issue(unsigned warp_id, warp_inst_t &inst);
+  void cam_complete(class mem_fetch *mf);
+  void cam_log_wait(unsigned warp_id, unsigned kind, unsigned slot,
+                    unsigned count, unsigned long long t_issue);
+  unsigned cam_warp_outstanding(unsigned warp_id) const;
+  const memory_config *cam_mem_config() const { return m_memory_config; }
+  std::vector<std::vector<unsigned long long>> m_cam_done, m_cam_free;
+  std::vector<unsigned> m_cam_first_warp;
   bool warp_waiting_at_mem_barrier(unsigned warp_id);
   void set_max_cta(const kernel_info_t &kernel);
   void warp_inst_complete(const warp_inst_t &inst);

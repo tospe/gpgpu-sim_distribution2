@@ -1077,7 +1077,7 @@ typedef std::bitset<SECTOR_CHUNCK_SIZE> mem_access_sector_mask_t;
       MA_TUP(CONST_ACC_R), MA_TUP(TEXTURE_ACC_R), MA_TUP(GLOBAL_ACC_W), \
       MA_TUP(CHIPLET_ACC_W), MA_TUP(LOCAL_ACC_W), MA_TUP(L1_WRBK_ACC),  \
       MA_TUP(L2_WRBK_ACC), MA_TUP(INST_ACC_R), MA_TUP(L1_WR_ALLOC_R),   \
-      MA_TUP(L2_WR_ALLOC_R),                                            \
+      MA_TUP(L2_WR_ALLOC_R), MA_TUP(CAM_ACC_R), MA_TUP(CAM_ACC_W),      \
       MA_TUP(NUM_MEM_ACCESS_TYPE) MA_TUP_END(mem_access_type)
 
 #define MA_TUP_BEGIN(X) enum X {
@@ -1461,6 +1461,20 @@ enum divergence_support_t { POST_DOMINATOR = 1, NUM_SIMD_MODEL };
 
 const unsigned MAX_ACCESSES_PER_INSN_PER_THREAD = 8;
 
+// CAM extension (docs/h100_cam_protocol.md in cam_with_gpu). Synthetic,
+// warp-uniform instructions; memory-class ops travel to the CAM unit at the
+// array's home L2 sub-partition, wait/release ops act on per-CTA counters.
+enum cam_op_t {
+  CAM_OP_NONE = 0,
+  CAM_OP_FILL,    // UCAMF.N<n>: fill n rows (imm = slot << 20 | first row)
+  CAM_OP_WRITE,   // UCAMW: write one row (imm = slot << 20 | row)
+  CAM_OP_QPUSH,   // UCAMQ: posted 128 B query chunk
+  CAM_OP_SEARCH,  // UCAMS.ASYNC.BE.K<k>.DSA: submit search (imm = slot)
+  CAM_OP_WAIT,    // CAMWAIT: until done[slot] >= n (imm = slot << 16 | n)
+  CAM_OP_WAITF,   // CAMWAITF: until free[slot] >= n (imm = slot << 16 | n)
+  CAM_OP_REL      // CAMREL: free[slot] += 1 (imm = slot)
+};
+
 class warp_inst_t : public inst_t {
   // TODO Weili Oct, 8 2025: Fields unique to certain type of instructions
   // TODO should be grouped under a union to reduce memory usage
@@ -1486,6 +1500,14 @@ class warp_inst_t : public inst_t {
     m_is_ldgsts_arrives_mbar = false;
     m_is_ldgsts_arrives_arvcnt = false;
     m_is_gmma_commit_group = false;
+    m_cam_op = CAM_OP_NONE;
+    m_cam_k = 0;
+    m_cam_slot = 0;
+    m_cam_count = 0;
+    m_cam_rows = 0;
+    m_cam_row = 0;
+    m_cam_seq = 0;
+    m_cam_warp_in_cta = 0;
     memset(m_ldgsts_arrives_mbar_addr, 0, sizeof(m_ldgsts_arrives_mbar_addr));
   }
   warp_inst_t(const core_config *config) {
@@ -1520,6 +1542,14 @@ class warp_inst_t : public inst_t {
     m_is_ldgsts_arrives_mbar = false;
     m_is_ldgsts_arrives_arvcnt = false;
     m_is_gmma_commit_group = false;
+    m_cam_op = CAM_OP_NONE;
+    m_cam_k = 0;
+    m_cam_slot = 0;
+    m_cam_count = 0;
+    m_cam_rows = 0;
+    m_cam_row = 0;
+    m_cam_seq = 0;
+    m_cam_warp_in_cta = 0;
     memset(m_ldgsts_arrives_mbar_addr, 0, sizeof(m_ldgsts_arrives_mbar_addr));
   }
   virtual ~warp_inst_t() {}
@@ -1794,6 +1824,22 @@ class warp_inst_t : public inst_t {
 
   // GMMA commit group
   bool m_is_gmma_commit_group;
+  // CAM extension (see cam_op_t)
+  cam_op_t m_cam_op;
+  unsigned m_cam_k;      // results per search (K<k>)
+  unsigned m_cam_slot;   // completion slot
+  unsigned m_cam_count;  // CAMWAIT/CAMWAITF threshold
+  unsigned m_cam_rows;   // UCAMF row count
+  unsigned m_cam_row;    // UCAMF first row / UCAMW row
+  unsigned m_cam_seq;    // per-warp search sequence number (set at issue)
+  unsigned
+      m_cam_warp_in_cta;  // issuing warp's index within its CTA (set at issue)
+  bool is_cam() const { return m_cam_op != CAM_OP_NONE; }
+  unsigned long long get_issue_cycle() const { return issue_cycle; }
+  bool is_cam_mem() const {
+    return m_cam_op == CAM_OP_FILL || m_cam_op == CAM_OP_WRITE ||
+           m_cam_op == CAM_OP_QPUSH || m_cam_op == CAM_OP_SEARCH;
+  }
 
   // For mbarrier-based LDGSTS completion mechanism
   bool m_is_ldgsts_arrives_mbar;

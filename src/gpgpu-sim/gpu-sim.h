@@ -366,6 +366,26 @@ class memory_config {
   unsigned rop_latency;
   unsigned dram_latency;
 
+  // CAM extension (docs/h100_cam_protocol.md). All delays in core cycles.
+  // All values are hypothetical architectural parameters, not measurements.
+  bool cam_enabled;
+  unsigned cam_num_rows;
+  unsigned cam_search_latency;  // L: admission -> first result selected
+  unsigned cam_search_ii;       // min cycles between search starts
+  unsigned cam_topk_latency;    // readout cycles per result
+  unsigned cam_result_entry_bytes;
+  unsigned cam_result_pkt_bytes;
+  unsigned cam_max_outstanding;       // searches in service per unit
+  unsigned cam_warp_max_outstanding;  // in-flight searches per warp
+  unsigned cam_slots;                 // completion slots per CTA
+  unsigned cam_query_bytes;           // staged bytes before admission
+  unsigned cam_write_latency;
+  unsigned cam_fill_setup_latency;
+  unsigned cam_fill_row_latency;
+  unsigned cam_input_queue;  // unit input queue entries
+  char *cam_func_file;       // functional data (keys, queries)
+  char *cam_result_log;      // per-request result/event log
+
   // DRAM parameters
 
   unsigned tCCDL;  // column to column delay when bank groups are enabled
@@ -601,9 +621,16 @@ class watchpoint_event {
   const ptx_instruction *m_inst;
 };
 
+class cam_functional;
+class cam_log;
 class gpgpu_sim : public gpgpu_t {
  public:
   gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx);
+  // CAM extension: functional contents and per-request log (may be null)
+  cam_functional *get_cam_functional() const { return m_cam_func; }
+  cam_log *get_cam_log() const { return m_cam_log; }
+  cam_functional *m_cam_func = NULL;
+  cam_log *m_cam_log = NULL;
 
   void set_prop(struct cudaDeviceProp *prop);
 

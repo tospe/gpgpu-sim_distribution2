@@ -340,6 +340,12 @@ class memory_sub_partition {
 
   unsigned get_id() const { return m_id; }
   unsigned get_chiplet_id() const { return m_chiplet_id; }
+  // CAM extension: the CAM unit at this sub-partition (null when disabled)
+  class cam_unit *m_cam = NULL;
+  void cam_cycle(unsigned long long now);
+  mem_fetch *cam_top(unsigned long long now);
+  void cam_pop();
+  void cam_print_stats(FILE *fp) const;
 
   bool busy() const;
 

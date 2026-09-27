@@ -12,6 +12,7 @@ list(APPEND gpgpusim_SRC addrdec.cc
     local_interconnect.cc
     mem_fetch.cc
     mem_latency_stat.cc
+    cam.cc
     power_interface.cc
     power_stat.cc
     scoreboard.cc
