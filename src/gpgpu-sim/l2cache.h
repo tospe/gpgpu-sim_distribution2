@@ -347,6 +347,29 @@ class memory_sub_partition {
   mem_fetch *cam_top(unsigned long long now);
   void cam_pop();
   bool cam_busy() const;
+  // F1: reply-port arbitration state/statistics (CAM vs ordinary L2 replies)
+  bool cam_rr_prefers_cam() const { return m_rr_cam_next; }
+  void cam_note_grant(bool to_cam, bool both_ready) {
+    if (both_ready) {
+      n_both_ready_grants++;
+      if (to_cam) n_both_ready_grants_cam++;
+      if (to_cam == m_rr_last_to_cam && m_rr_have_last) {
+        m_rr_run++;
+      } else {
+        m_rr_run = 1;
+      }
+      if (m_rr_run > n_max_consecutive_same) n_max_consecutive_same = m_rr_run;
+      m_rr_last_to_cam = to_cam;
+      m_rr_have_last = true;
+      m_rr_cam_next = !to_cam;
+    } else {
+      m_rr_have_last = false;  // runs only count while both were ready
+    }
+  }
+  bool m_rr_cam_next = true, m_rr_last_to_cam = false, m_rr_have_last = false;
+  unsigned long long m_rr_run = 0, n_both_ready_grants = 0,
+                     n_both_ready_grants_cam = 0, n_max_consecutive_same = 0,
+                     n_reserved_cycles = 0;
   void cam_print_stats(FILE *fp) const;
 
   bool busy() const;

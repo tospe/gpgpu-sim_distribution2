@@ -2374,19 +2374,26 @@ void gpgpu_sim::cycle() {
   if (clock_mask & L2) {
     // pop from L2 to interconnect
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
-      // CAM extension: CAM replies go straight back to the SM
-      if (m_memory_config->cam_enabled) {
-        mem_fetch *cam_mf = m_memory_sub_partition[i]->cam_top(
-            gpu_sim_cycle + gpu_tot_sim_cycle);
-        if (cam_mf &&
-            handle_mf_reply(i, cam_mf, partiton_replys_in_parallel_per_cycle)) {
-          m_memory_sub_partition[i]->cam_pop();
-          continue;  // one reply per sub-partition per cycle
-        }
-      }
+      // CAM extension (finding F1 fix): per-packet, work-conserving round-robin
+      // between a ready CAM reply and a ready ordinary L2 reply at this
+      // sub-partition's reply injection. A whole packet is granted; the network
+      // still serialises its flits and applies backpressure. With no CAM reply
+      // waiting, the original L2 path below runs unchanged. Proposed
+      // integration policy, not a measured H100 arbitration policy.
+      mem_fetch *cam_mf = m_memory_config->cam_enabled
+                              ? m_memory_sub_partition[i]->cam_top(
+                                    gpu_sim_cycle + gpu_tot_sim_cycle)
+                              : NULL;
       // The mf that gets send down to L2
       mem_fetch *base_mf = m_memory_sub_partition[i]->top();
-      if (base_mf) {
+      auto try_cam = [&]() {
+        if (!handle_mf_reply(i, cam_mf, partiton_replys_in_parallel_per_cycle))
+          return false;
+        m_memory_sub_partition[i]->cam_pop();
+        return true;
+      };
+      // original L2 reply path; returns whether it made progress
+      auto try_l2 = [&]() {
         if (base_mf->get_src_chiplet() ==
             m_memory_sub_partition[i]->get_chiplet_id()) {
           // Handle LRC if it is enabled and the base_mf is a read reply
@@ -2395,6 +2402,7 @@ void gpgpu_sim::cycle() {
             // With LRC enabled, we need to send back all the request
             // via multicast to each mf's originator
             handle_lrc_reply(i, base_mf, partiton_replys_in_parallel_per_cycle);
+            return true;
           } else {
             // With LRC disable or write ack, just send back the base_mf to ICNT
             // Counter gpu_stall_icnt2sh and
@@ -2406,6 +2414,7 @@ void gpgpu_sim::cycle() {
               // If reply sending succeeds
               m_memory_sub_partition[i]->pop();
             }
+            return success;
           }
         } else {
           // go to the other chiplet
@@ -2413,9 +2422,54 @@ void gpgpu_sim::cycle() {
           if (success) {
             m_memory_sub_partition[i]->pop();
           }
+          return success;
         }
-      } else {
+      };
+      if (!cam_mf) {
+        if (base_mf)
+          try_l2();
+        else
+          m_memory_sub_partition[i]->pop();
+      } else if (!base_mf) {
+        if (try_cam()) m_memory_sub_partition[i]->cam_note_grant(true, false);
         m_memory_sub_partition[i]->pop();
+      } else {
+        // both ready: the source not granted last goes first; if it cannot
+        // send, the other may use the port (work-conserving)
+        // Space reservation: if the preferred source is blocked only because
+        // its (larger) packet does not fit in the injection buffer, the other
+        // source may send only if the buffer holds both packets, so it cannot
+        // keep consuming the space the preferred packet is waiting for
+        // (a 4-flit CAM result packet vs 1-flit sector replies starved the CAM
+        // in the first F1 version).
+        const bool cam_first = m_memory_sub_partition[i]->cam_rr_prefers_cam();
+        const unsigned port = m_shader_config->mem2device(i);
+        const unsigned cam_sz = cam_mf->size();
+        const bool l2_uses_port = base_mf->get_src_chiplet() ==
+                                  m_memory_sub_partition[i]->get_chiplet_id();
+        const unsigned l2_sz = base_mf->get_is_write()
+                                   ? base_mf->get_ctrl_size()
+                                   : base_mf->size();
+        bool cam_sent = false, l2_sent = false;
+        if (cam_first) {
+          cam_sent = try_cam();
+          if (!cam_sent) {
+            if (!l2_uses_port || ::icnt_has_buffer(port, cam_sz + l2_sz))
+              l2_sent = try_l2();
+            else
+              m_memory_sub_partition[i]->n_reserved_cycles++;
+          }
+        } else {
+          l2_sent = try_l2();
+          if (!l2_sent) {
+            if (!l2_uses_port || ::icnt_has_buffer(port, cam_sz + l2_sz))
+              cam_sent = try_cam();
+            else
+              m_memory_sub_partition[i]->n_reserved_cycles++;
+          }
+        }
+        if (cam_sent || l2_sent)
+          m_memory_sub_partition[i]->cam_note_grant(cam_sent, true);
       }
     }
   }

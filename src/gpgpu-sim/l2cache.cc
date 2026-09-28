@@ -716,7 +716,16 @@ mem_fetch *memory_sub_partition::cam_top(unsigned long long now) {
 void memory_sub_partition::cam_pop() { m_cam->pop(); }
 bool memory_sub_partition::cam_busy() const { return m_cam && m_cam->busy(); }
 void memory_sub_partition::cam_print_stats(FILE *fp) const {
-  if (m_cam && m_cam->saw_traffic()) m_cam->print_stats(fp);
+  if (m_cam && m_cam->saw_traffic()) {
+    m_cam->print_stats(fp);
+    fprintf(fp,
+            "cam_reply_arbitration[%u]: both_ready_grants=%llu to_cam=%llu "
+            "to_l2=%llu max_consecutive_same_source=%llu "
+            "reserved_cycles=%llu\n",
+            m_id, n_both_ready_grants, n_both_ready_grants_cam,
+            n_both_ready_grants - n_both_ready_grants_cam,
+            n_max_consecutive_same, n_reserved_cycles);
+  }
 }
 
 bool memory_sub_partition::lrc_full() const {
