@@ -464,6 +464,7 @@ memory_sub_partition::memory_sub_partition(
   if (config->cam_enabled)
     m_cam = new cam_endpoint(config, sub_partition_id,
                              gpu->get_cam_functional(), gpu->get_cam_log());
+  if (m_cam) m_cam->set_staging(gpu->cam_staging(sub_partition_id));
   uint32_t local_sub_partition_id =
       sub_partition_id % config->m_n_sub_partition_per_chiplet;
   m_chiplet_icnt.init(m_chiplet_id, local_sub_partition_id, request_0_to_1,
@@ -728,6 +729,12 @@ void memory_sub_partition::cam_print_stats(FILE *fp) const {
             m_id, n_both_ready_grants, n_both_ready_grants_cam,
             n_both_ready_grants - n_both_ready_grants_cam,
             n_max_consecutive_same, n_reserved_cycles);
+    fprintf(fp,
+            "cam_ports[%u]: req_cam=%llu req_l2=%llu req_refused_cycles=%llu "
+            "rep_cam=%llu rep_cam_flits=%llu rep_l2=%llu rep_l2_flits=%llu "
+            "rep_cam_waiting_cycles=%llu\n",
+            m_id, n_req_cam, n_req_l2, n_req_refused, n_rep_cam,
+            n_rep_cam_flits, n_rep_l2, n_rep_l2_flits, n_rep_cam_waiting);
   }
 }
 

@@ -164,6 +164,7 @@ class shd_warp_t {
     m_cam_seq = 0;
     m_cam_wait_kind = 0;
     m_cam_wait_slot = 0;
+    m_cam_q_bytes = 0;
     m_cam_wait_count = 0;
     m_cam_wait_issue = 0;
 
@@ -222,6 +223,7 @@ class shd_warp_t {
     m_cam_seq = 0;
     m_cam_wait_kind = 0;
     m_cam_wait_slot = 0;
+    m_cam_q_bytes = 0;
     m_cam_wait_count = 0;
     m_cam_wait_issue = 0;
 
@@ -306,6 +308,8 @@ class shd_warp_t {
   unsigned m_cam_seq;        // next search sequence number of this warp
   unsigned m_cam_wait_kind;  // 0 none, 1 CAMWAIT (done), 2 CAMWAITF (free)
   unsigned m_cam_wait_slot;
+  // F5: bytes of the current query already issued as UCAMQ chunks
+  unsigned long long m_cam_q_bytes = 0;
   unsigned m_cam_wait_count;
   unsigned long long m_cam_wait_issue;
   unsigned long long m_cam_qstart = 0;  // first UCAMQ issue of the open query
@@ -2821,6 +2825,9 @@ class shader_core_ctx : public core_t {
     return slot < v.size() ? v[slot] : 0;
   }
   void cam_issue(unsigned warp_id, warp_inst_t &inst);
+  // F5: may this UCAMQ issue (a query's first chunk needs a staging
+  // reservation at the home unit)?
+  bool cam_staging_ok(unsigned warp_id, const warp_inst_t &inst);
   void cam_complete(class mem_fetch *mf);
   void cam_packet(class mem_fetch *mf);
   void cam_log_wait(unsigned warp_id, unsigned kind, unsigned slot,

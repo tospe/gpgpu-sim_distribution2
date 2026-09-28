@@ -400,7 +400,8 @@ class memory_config {
   char *cam_addr_probe;       // diagnostic: file of addresses to decode
   unsigned cam_output_buffer_bytes;  // CAM output buffer (result bytes), F2
   unsigned cam_link_rx_bytes;  // external: inbound in-flight + endpoint receive
-                               // bytes
+  unsigned cam_staging_bytes;
+  // bytes
 
   // DRAM parameters
 
@@ -639,6 +640,7 @@ class watchpoint_event {
 
 class cam_functional;
 class cam_log;
+struct cam_staging_pool;
 class gpgpu_sim : public gpgpu_t {
  public:
   gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx);
@@ -646,6 +648,9 @@ class gpgpu_sim : public gpgpu_t {
   cam_functional *get_cam_functional() const { return m_cam_func; }
   cam_log *get_cam_log() const { return m_cam_log; }
   bool cam_busy();
+  cam_staging_pool *cam_staging(unsigned sub_partition);
+  unsigned cam_home(new_addr_type addr) const;
+  cam_staging_pool *m_cam_staging = NULL;  // one per sub-partition (F5)
   unsigned long long m_last_cam_progress = 0;
   cam_functional *m_cam_func = NULL;
   cam_log *m_cam_log = NULL;

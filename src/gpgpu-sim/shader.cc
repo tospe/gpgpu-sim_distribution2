@@ -1590,6 +1590,11 @@ void scheduler_unit::cycle() {
                         m_shader->cam_mem_config()->cam_warp_max_outstanding) {
                   break;
                 }
+                // CAM (F5): a query's first chunk needs a staging reservation
+                if (pI->m_cam_op == CAM_OP_QPUSH &&
+                    !m_shader->cam_staging_ok(warp_id, *pI)) {
+                  break;
+                }
                 // Check TRYWAIT before issuing - if not ready, skip issue
                 if (pI->is_syncs_try_wait() &&
                     !m_shader->check_trywait_ready(pI, warp_id)) {
@@ -5047,6 +5052,12 @@ bool shd_warp_t::functional_done() const {
 // ---------------------------------------------------------------- CAM
 // Issue-time effects of CAM instructions (the pipeline copy is per dynamic
 // instance, so stamping it is safe; mem_fetch copies it).
+static unsigned first_active_lane(const warp_inst_t &inst) {
+  for (unsigned i = 0; i < MAX_WARP_SIZE; i++)
+    if (inst.active(i)) return i;
+  return 0;
+}
+
 void shader_core_ctx::cam_issue(unsigned warp_id, warp_inst_t &inst) {
   shd_warp_t *w = m_warp[warp_id];
   const unsigned cta = w->get_cta_id();
@@ -5077,9 +5088,20 @@ void shader_core_ctx::cam_issue(unsigned warp_id, warp_inst_t &inst) {
     m_cam_sub[cta][s]++;
   }
   switch (inst.m_cam_op) {
-    case CAM_OP_QPUSH:
+    case CAM_OP_QPUSH: {
       if (!w->m_cam_qstart) w->m_cam_qstart = now;  // query preparation starts
+      // F5: the first chunk of a query reserves a whole query's staging
+      const unsigned long long q = m_memory_config->cam_query_bytes;
+      if (w->m_cam_q_bytes % q == 0) {
+        cam_staging_pool *p = m_gpu->cam_staging(
+            m_gpu->cam_home(inst.get_addr(first_active_lane(inst))));
+        assert(p && p->can_reserve(q));
+        p->reserve(q);
+      }
+      w->m_cam_q_bytes +=
+          (unsigned long long)inst.active_count() * inst.data_size;
       break;
+    }
     case CAM_OP_SEARCH:
       inst.m_cam_seq = w->m_cam_seq++;
       inst.m_cam_qready = w->m_cam_qstart ? w->m_cam_qstart : now;
@@ -5108,6 +5130,18 @@ void shader_core_ctx::cam_issue(unsigned warp_id, warp_inst_t &inst) {
     default:
       break;
   }
+}
+
+bool shader_core_ctx::cam_staging_ok(unsigned warp_id,
+                                     const warp_inst_t &inst) {
+  const unsigned long long q = m_memory_config->cam_query_bytes;
+  if (m_warp[warp_id]->m_cam_q_bytes % q != 0) return true;  // query started
+  if (inst.active_count() == 0) return true;
+  cam_staging_pool *p = m_gpu->cam_staging(
+      m_gpu->cam_home(inst.get_addr(first_active_lane(inst))));
+  if (!p || p->can_reserve(q)) return true;
+  p->n_wait++;  // issue attempts held for a staging reservation
+  return false;
 }
 
 // Every CAM reply packet at LDST writeback (records the first packet's time).

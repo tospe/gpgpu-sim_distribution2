@@ -74,6 +74,28 @@ class cam_log {
   std::map<unsigned long long, std::vector<std::pair<int, float>>> m_pending;
 };
 
+// Unit-wide query staging capacity (F5, spec §10c). One pool per unit, shared
+// by all warps' staging areas; identical in both placements. A query reserves
+// cam_query_bytes when its issuing warp issues the query's first UCAMQ chunk
+// (the warp stalls if the reservation does not fit), so every chunk of an
+// accepted query has room when it arrives. The reservation is released when
+// the search is admitted: the query then moves into the engine's in-service
+// storage (max_outstanding x query bytes, a separate fixed allocation).
+// cap = 0: unbounded (legacy configurations). The credit is visible to the SM
+// without delay (credit-return latency not modelled; optimistic).
+struct cam_staging_pool {
+  unsigned long long cap = 0, reserved = 0, arrived = 0, peak_reserved = 0,
+                     peak_arrived = 0, n_reserve = 0, n_release = 0, n_wait = 0;
+  bool can_reserve(unsigned long long q) const {
+    return !cap || reserved + q <= cap;
+  }
+  void reserve(unsigned long long q) {
+    reserved += q;
+    n_reserve++;
+    if (reserved > peak_reserved) peak_reserved = reserved;
+  }
+};
+
 class cam_unit {
  public:
   cam_unit(const memory_config *config, unsigned sub_partition_id,
@@ -84,6 +106,7 @@ class cam_unit {
   mem_fetch *top(unsigned long long now);  // next reply ready by now, or NULL
   // select results due by now (called before replies are taken each cycle)
   void readout_advance(unsigned long long now);
+  void set_staging(cam_staging_pool *p) { m_pool = p; }
   void pop();
   bool busy() const;
   void print_stats(FILE *fp) const;
@@ -121,6 +144,7 @@ class cam_unit {
   unsigned m_n_in_service = 0;
   unsigned long long m_out_bytes = 0, m_out_cap = 0;  // output buffer (F2)
   bool m_stalled = false;
+  cam_staging_pool *m_pool = NULL;
   unsigned long long m_progress = 0;
   unsigned long long m_stall_since = 0;
 
@@ -181,6 +205,7 @@ class cam_endpoint {
     return m_engine.scheduled_work() || !m_out.empty() || !m_in.empty();
   }
   unsigned long long progress() const { return m_engine.progress(); }
+  void set_staging(cam_staging_pool *p) { m_engine.set_staging(p); }
   void print_stats(FILE *fp) const;
 
  private:

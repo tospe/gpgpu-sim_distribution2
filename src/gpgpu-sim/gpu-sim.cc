@@ -405,6 +405,13 @@ void memory_config::reg_options(class OptionParser *opp) {
                          "injection); a packet starts only if it fits "
                          "(hypothetical)",
                          "32768");
+  option_parser_register(opp, "-gpgpu_cam_staging_bytes", OPT_UINT32,
+                         &cam_staging_bytes,
+                         "CAM unit-wide query staging capacity in bytes; a "
+                         "query reserves cam_query_bytes at its first UCAMQ "
+                         "chunk and releases it at admission (0 = unbounded, "
+                         "legacy) (hypothetical)",
+                         "0");
   option_parser_register(opp, "-gpgpu_cam_addr_probe", OPT_CSTR,
                          &cam_addr_probe,
                          "CAM diagnostic: print the sub-partition of each hex "
@@ -1237,6 +1244,18 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
         if (pf) fclose(pf);
       }
       m_cam_func = new cam_functional(m_memory_config->cam_func_file);
+      const unsigned long long scap = m_memory_config->cam_staging_bytes;
+      if (scap && scap < m_memory_config->cam_query_bytes) {
+        fprintf(stderr,
+                "GPGPU-Sim CAM: -gpgpu_cam_staging_bytes %llu < one query "
+                "(%u B)\n",
+                scap, m_memory_config->cam_query_bytes);
+        abort();
+      }
+      m_cam_staging =
+          new cam_staging_pool[m_memory_config->m_n_mem_sub_partition];
+      for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++)
+        m_cam_staging[i].cap = scap;
       m_cam_log = new cam_log(m_memory_config->cam_result_log);
     }
     for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
@@ -1657,6 +1676,18 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
 // and so are readout steps / packets leaving a CAM unit since the last check.
 // Either suppresses the no-instructions-committed deadlock check; a CAM
 // output stalled on a blocked reply port with no progress does not.
+// home sub-partition of a CAM array address (decoded as from TPC 0, like the
+// CAM accesses themselves)
+cam_staging_pool *gpgpu_sim::cam_staging(unsigned sub_partition) {
+  return m_cam_staging ? &m_cam_staging[sub_partition] : NULL;
+}
+
+unsigned gpgpu_sim::cam_home(new_addr_type addr) const {
+  addrdec_t t;
+  m_memory_config->m_address_mapping.addrdec_tlx(addr, &t, 0);
+  return t.sub_partition;
+}
+
 bool gpgpu_sim::cam_busy() {
   if (!m_memory_config->cam_enabled) return false;
   unsigned long long prog = 0;
@@ -2454,7 +2485,10 @@ void gpgpu_sim::cycle() {
         else
           m_memory_sub_partition[i]->pop();
       } else if (!base_mf) {
-        if (try_cam()) m_memory_sub_partition[i]->cam_note_grant(true, false);
+        if (try_cam())
+          m_memory_sub_partition[i]->cam_note_grant(true, false);
+        else
+          m_memory_sub_partition[i]->n_rep_cam_waiting++;
         m_memory_sub_partition[i]->pop();
       } else {
         // both ready: the source not granted last goes first; if it cannot
@@ -2493,6 +2527,7 @@ void gpgpu_sim::cycle() {
         }
         if (cam_sent || l2_sent)
           m_memory_sub_partition[i]->cam_note_grant(cam_sent, true);
+        if (!cam_sent) m_memory_sub_partition[i]->n_rep_cam_waiting++;
       }
     }
   }
@@ -2534,13 +2569,24 @@ void gpgpu_sim::cycle() {
         // Only count as a stall if ICNT actually has a packet waiting for
         // this sub-partition; otherwise the L2 being full is not blocking
         // anything.
-        if (icnt_has_packet(m_shader_config->mem2device(i)))
+        if (icnt_has_packet(m_shader_config->mem2device(i))) {
           gpu_stall_icnt2mem++;
+          m_memory_sub_partition[i]->n_req_refused++;
+        }
       } else if (m_memory_sub_partition[i]->lrc_full(SECTOR_CHUNCK_SIZE)) {
         m_memory_stats->add_l2_stall_due_to_lrc_full(i);
+        if (icnt_has_packet(m_shader_config->mem2device(i)))
+          m_memory_sub_partition[i]->n_req_refused++;
 
       } else {
         mem_fetch *mf = (mem_fetch *)icnt_pop(m_shader_config->mem2device(i));
+        if (mf) {  // P1 counter (before push may divert/consume it)
+          if (mf->get_access_type() == CAM_ACC_R ||
+              mf->get_access_type() == CAM_ACC_W)
+            m_memory_sub_partition[i]->n_req_cam++;
+          else
+            m_memory_sub_partition[i]->n_req_l2++;
+        }
         m_memory_sub_partition[i]->push(mf, gpu_sim_cycle + gpu_tot_sim_cycle);
         if (mf) partiton_reqs_in_parallel_per_cycle++;
       }
@@ -2821,6 +2867,19 @@ bool gpgpu_sim::handle_mf_reply(unsigned subpartition_id, mem_fetch *mf,
     mf->set_status(IN_ICNT_TO_SHADER, gpu_sim_cycle + gpu_tot_sim_cycle);
     ::icnt_push(m_shader_config->mem2device(subpartition_id), mf->get_tpc(), mf,
                 response_size);
+    // P1 counters (statistics only)
+    memory_sub_partition *sp = m_memory_sub_partition[subpartition_id];
+    const unsigned flits =
+        (response_size + m_memory_config->icnt_flit_size - 1) /
+        m_memory_config->icnt_flit_size;
+    if (mf->m_cam.valid || mf->get_access_type() == CAM_ACC_R ||
+        mf->get_access_type() == CAM_ACC_W) {
+      sp->n_rep_cam++;
+      sp->n_rep_cam_flits += flits;
+    } else {
+      sp->n_rep_l2++;
+      sp->n_rep_l2_flits += flits;
+    }
     // Also update the parallel_reply_count
     parallel_reply_count++;
     return true;

@@ -371,6 +371,12 @@ class memory_sub_partition {
   unsigned long long m_rr_run = 0, n_both_ready_grants = 0,
                      n_both_ready_grants_cam = 0, n_max_consecutive_same = 0,
                      n_reserved_cycles = 0;
+  // P1 port counters (statistics only): request input port (packets accepted
+  // from the NoC; L2 cycles refused while a packet waited) and reply injection
+  // (packets and flits injected; L2 cycles a ready CAM reply was not injected)
+  unsigned long long n_req_cam = 0, n_req_l2 = 0, n_req_refused = 0,
+                     n_rep_cam = 0, n_rep_cam_flits = 0, n_rep_l2 = 0,
+                     n_rep_l2_flits = 0, n_rep_cam_waiting = 0;
   void cam_print_stats(FILE *fp) const;
 
   bool busy() const;

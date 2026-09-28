@@ -348,6 +348,11 @@ void cam_unit::cycle(unsigned long long now) {
     if (mf->get_inst().m_cam_op == CAM_OP_QPUSH) {
       m_staged[std::make_pair(mf->get_sid(), mf->get_wid())] +=
           mf->get_access_size();
+      if (m_pool) {  // bytes of reserved queries that have arrived
+        m_pool->arrived += mf->get_access_size();
+        if (m_pool->arrived > m_pool->peak_arrived)
+          m_pool->peak_arrived = m_pool->arrived;
+      }
       n_qpush++;
       n_qpush_bytes += mf->get_access_size();
       delete mf;
@@ -397,6 +402,13 @@ void cam_unit::cycle(unsigned long long now) {
     return;
   }
   m_staged[key] -= m_config->cam_query_bytes;
+  if (m_pool) {  // admitted: the query leaves staging for in-service storage
+    assert(m_pool->reserved >= m_config->cam_query_bytes &&
+           m_pool->arrived >= m_config->cam_query_bytes);
+    m_pool->reserved -= m_config->cam_query_bytes;
+    m_pool->arrived -= m_config->cam_query_bytes;
+    m_pool->n_release++;
+  }
   m_input.pop_front();
   start_search(mf, now);
 }
@@ -416,20 +428,26 @@ void cam_unit::pop() {
 }
 
 void cam_unit::print_stats(FILE *fp) const {
-  fprintf(fp,
-          "cam_unit[%u]: searches=%llu fills=%llu fill_rows=%llu writes=%llu "
-          "overflow=%llu qpush=%llu qpush_bytes=%llu result_pkts=%llu "
-          "peak_in_service=%llu ii_wait=%llu admit_wait_query=%llu "
-          "admit_wait_outstanding=%llu admit_wait_mutation=%llu "
-          "readout_wait=%llu input_full_cycles=%llu out_buf_cap=%u "
-          "peak_out_buf_bytes=%llu readout_stalls=%llu "
-          "readout_stall_cycles=%llu readout_limited_steps=%llu\n",
-          m_id, n_searches, n_fills, n_fill_rows, n_writes, n_overflow, n_qpush,
-          n_qpush_bytes, n_result_pkts, n_peak_in_service, n_ii_wait_cycles,
-          n_admit_wait_query, n_admit_wait_outstanding, n_admit_wait_mutation,
-          n_readout_wait_cycles, n_input_full_cycles, m_out_cap,
-          n_peak_out_bytes, n_readout_stalls, n_readout_stall_cycles,
-          n_readout_limited_steps);
+  fprintf(
+      fp,
+      "cam_unit[%u]: searches=%llu fills=%llu fill_rows=%llu writes=%llu "
+      "overflow=%llu qpush=%llu qpush_bytes=%llu result_pkts=%llu "
+      "peak_in_service=%llu ii_wait=%llu admit_wait_query=%llu "
+      "admit_wait_outstanding=%llu admit_wait_mutation=%llu "
+      "readout_wait=%llu input_full_cycles=%llu out_buf_cap=%u "
+      "peak_out_buf_bytes=%llu readout_stalls=%llu "
+      "readout_stall_cycles=%llu readout_limited_steps=%llu "
+      "staging_cap=%llu peak_staging_reserved=%llu "
+      "peak_staging_arrived=%llu staging_reservations=%llu "
+      "staging_releases=%llu staging_wait=%llu\n",
+      m_id, n_searches, n_fills, n_fill_rows, n_writes, n_overflow, n_qpush,
+      n_qpush_bytes, n_result_pkts, n_peak_in_service, n_ii_wait_cycles,
+      n_admit_wait_query, n_admit_wait_outstanding, n_admit_wait_mutation,
+      n_readout_wait_cycles, n_input_full_cycles, m_out_cap, n_peak_out_bytes,
+      n_readout_stalls, n_readout_stall_cycles, n_readout_limited_steps,
+      m_pool ? m_pool->cap : 0ULL, m_pool ? m_pool->peak_reserved : 0ULL,
+      m_pool ? m_pool->peak_arrived : 0ULL, m_pool ? m_pool->n_reserve : 0ULL,
+      m_pool ? m_pool->n_release : 0ULL, m_pool ? m_pool->n_wait : 0ULL);
 }
 
 // ---------------------------------------------------------------- transport
