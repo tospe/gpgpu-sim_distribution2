@@ -1615,6 +1615,16 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
   }
 }
 
+// CAM extension: CAM requests in flight are progress (a warp may legitimately
+// wait at CAMWAIT for longer than the deadlock sampling interval, e.g. a
+// large fill), so they suppress the no-instructions-committed deadlock check.
+bool gpgpu_sim::cam_busy() const {
+  if (!m_memory_config->cam_enabled) return false;
+  for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++)
+    if (m_memory_sub_partition[i]->cam_busy()) return true;
+  return false;
+}
+
 void gpgpu_sim::deadlock_check() {
   if (m_config.gpu_deadlock_detect && gpu_deadlock) {
     fflush(stdout);
@@ -2601,7 +2611,8 @@ void gpgpu_sim::cycle() {
 
     if (!(gpu_sim_cycle % 50000)) {
       // deadlock detection
-      if (m_config.gpu_deadlock_detect && gpu_sim_insn == last_gpu_sim_insn) {
+      if (m_config.gpu_deadlock_detect && gpu_sim_insn == last_gpu_sim_insn &&
+          !cam_busy()) {
         gpu_deadlock = true;
       } else {
         last_gpu_sim_insn = gpu_sim_insn;
@@ -2890,7 +2901,8 @@ void sst_gpgpu_sim::SST_cycle() {
 
   if (!(gpu_sim_cycle % 20000)) {
     // deadlock detection
-    if (m_config.gpu_deadlock_detect && gpu_sim_insn == last_gpu_sim_insn) {
+    if (m_config.gpu_deadlock_detect && gpu_sim_insn == last_gpu_sim_insn &&
+        !cam_busy()) {
       gpu_deadlock = true;
     } else {
       last_gpu_sim_insn = gpu_sim_insn;

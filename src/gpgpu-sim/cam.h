@@ -87,6 +87,9 @@ class cam_unit {
   void print_stats(FILE *fp) const;
   // release time of the next reply (only valid if has_reply())
   bool has_reply() const { return !m_return.empty(); }
+  bool scheduled_work() const {
+    return m_mutation || !m_in_service.empty() || !m_return.empty();
+  }
   unsigned long long next_reply_time() const { return m_return.top().ready; }
 
  private:
@@ -150,6 +153,12 @@ class cam_endpoint {
   mem_fetch *top(unsigned long long now);
   void pop();
   bool saw_traffic() const;
+  // work scheduled to finish on its own (a fill/write in progress, searches in
+  // service, replies, packets on the link). A command blocked at the head of
+  // the input queue is NOT counted, so real deadlocks stay detectable.
+  bool busy() const {
+    return m_engine.scheduled_work() || !m_out.empty() || !m_in.empty();
+  }
   void print_stats(FILE *fp) const;
 
  private:

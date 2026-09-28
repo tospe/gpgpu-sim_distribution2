@@ -639,6 +639,7 @@ class gpgpu_sim : public gpgpu_t {
   // CAM extension: functional contents and per-request log (may be null)
   cam_functional *get_cam_functional() const { return m_cam_func; }
   cam_log *get_cam_log() const { return m_cam_log; }
+  bool cam_busy() const;
   cam_functional *m_cam_func = NULL;
   cam_log *m_cam_log = NULL;
 

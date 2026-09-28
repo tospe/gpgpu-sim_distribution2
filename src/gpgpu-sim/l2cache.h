@@ -346,6 +346,7 @@ class memory_sub_partition {
   void cam_cycle(unsigned long long now);
   mem_fetch *cam_top(unsigned long long now);
   void cam_pop();
+  bool cam_busy() const;
   void cam_print_stats(FILE *fp) const;
 
   bool busy() const;
