@@ -378,9 +378,21 @@ cam_endpoint::cam_endpoint(const memory_config *config,
   assert(config->cam_placement <= 1);
 }
 
+// Outbound window (spec §10). Packet mode: at most cam_link_out_queue packets.
+// Byte mode (cam_link_window_bytes > 0): a request packet (payload <= 32 B)
+// is accepted only if its wire bytes fit in the remaining window. A packet
+// occupies the window from acceptance until delivery into the engine input.
 bool cam_endpoint::full() const {
   if (!m_external) return m_engine.full();
+  if (m_config->cam_link_window_bytes)
+    return m_out_inflight_bytes + wire_bytes(32) >
+           m_config->cam_link_window_bytes;
   return m_out.size() >= m_config->cam_link_out_queue;
+}
+
+unsigned cam_endpoint::wire_bytes(unsigned payload) const {
+  const unsigned unit = std::max(1u, m_config->cam_link_unit_bytes);
+  return ((payload + m_config->cam_link_hdr_bytes + unit - 1) / unit) * unit;
 }
 
 unsigned long long cam_endpoint::usable(double t) {
@@ -396,10 +408,17 @@ unsigned cam_endpoint::payload_bytes(mem_fetch *mf, bool outbound) const {
   return inst.m_cam_op == CAM_OP_SEARCH ? mf->get_data_size() : 8;
 }
 
-double cam_endpoint::cross(bool outbound, unsigned payload, double t_ready) {
-  const unsigned unit = std::max(1u, m_config->cam_link_unit_bytes);
-  const unsigned bytes =
-      ((payload + m_config->cam_link_hdr_bytes + unit - 1) / unit) * unit;
+double cam_endpoint::cross(bool outbound, unsigned payload, double t_ready,
+                           unsigned *wire) {
+  const unsigned bytes = wire_bytes(payload);
+  if (wire) *wire = bytes;
+  if (outbound) {
+    n_out_payload += payload;
+    n_out_hdr += m_config->cam_link_hdr_bytes;
+  } else {
+    n_in_payload += payload;
+    n_in_hdr += m_config->cam_link_hdr_bytes;
+  }
   const double ghz = m_config->cam_core_ghz;
   // bytes / (GB/s) = ns; ns * GHz = core cycles
   const double ser = m_config->cam_link_gbps > 0
@@ -429,9 +448,14 @@ void cam_endpoint::push(mem_fetch *mf, unsigned long long now) {
     m_engine.push(mf, now);
     return;
   }
-  const double arrive = cross(true, payload_bytes(mf, true), (double)now);
-  m_out.push_back(link_pkt{arrive, mf});
+  unsigned wire = 0;
+  const double arrive =
+      cross(true, payload_bytes(mf, true), (double)now, &wire);
+  m_out.push_back(link_pkt{arrive, mf, wire, now});
   if (m_out.size() > n_peak_out_q) n_peak_out_q = m_out.size();
+  m_out_inflight_bytes += wire;
+  if (m_out_inflight_bytes > n_peak_out_inflight_bytes)
+    n_peak_out_inflight_bytes = m_out_inflight_bytes;
 }
 
 void cam_endpoint::cycle(unsigned long long now) {
@@ -443,6 +467,10 @@ void cam_endpoint::cycle(unsigned long long now) {
         break;
       }
       m_engine.push(m_out.front().mf, now);
+      // window release event: delivery into the engine input
+      m_out_inflight_bytes -= m_out.front().wire;
+      occ_cycles_out += now - m_out.front().accepted;
+      n_out_delivered++;
       m_out.pop_front();
     }
   } else if (full()) {
@@ -465,7 +493,8 @@ mem_fetch *cam_endpoint::top(unsigned long long now) {
     const unsigned long long rel = m_engine.next_reply_time();
     mem_fetch *mf = m_engine.top(now);
     m_engine.pop();
-    const double arrive = cross(false, payload_bytes(mf, false), (double)rel);
+    const double arrive =
+        cross(false, payload_bytes(mf, false), (double)rel, NULL);
     mf->m_cam.t_last_ready = rel;
     mf->m_cam.t_last_ep = usable(arrive);
     m_in.push_back(link_pkt{arrive, mf});
@@ -505,5 +534,14 @@ void cam_endpoint::print_stats(FILE *fp) const {
             m_config->cam_link_unit_bytes, m_config->cam_link_hdr_bytes,
             n_out_pkts, n_out_bytes, busy_out, qwait_out, n_peak_out_q,
             n_in_pkts, n_in_bytes, busy_in, qwait_in, n_peak_in_q);
+  if (m_external)
+    fprintf(
+        fp,
+        " window_bytes=%u out_payload=%llu out_hdr=%llu out_wire=%llu "
+        "in_payload=%llu in_hdr=%llu in_wire=%llu peak_out_inflight_bytes=%llu "
+        "mean_out_occupancy_cyc=%.2f",
+        m_config->cam_link_window_bytes, n_out_payload, n_out_hdr, n_out_bytes,
+        n_in_payload, n_in_hdr, n_in_bytes, n_peak_out_inflight_bytes,
+        n_out_delivered ? (double)occ_cycles_out / n_out_delivered : 0.0);
   fprintf(fp, "\n");
 }

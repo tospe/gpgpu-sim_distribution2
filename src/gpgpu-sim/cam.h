@@ -165,9 +165,12 @@ class cam_endpoint {
   struct link_pkt {
     double arrive;
     mem_fetch *mf;
+    unsigned wire;                // bytes on the link (units x unit size)
+    unsigned long long accepted;  // cycle accepted at the endpoint
   };
   unsigned payload_bytes(mem_fetch *mf, bool outbound) const;
-  double cross(bool outbound, unsigned payload, double t_ready);
+  double cross(bool outbound, unsigned payload, double t_ready, unsigned *wire);
+  unsigned wire_bytes(unsigned payload) const;
   static unsigned long long usable(double t);
 
   const memory_config *m_config;
@@ -178,6 +181,12 @@ class cam_endpoint {
   double m_free_out, m_free_in;
 
  public:
+  // outbound window occupancy in wire bytes: from acceptance at the endpoint
+  // until delivery into the engine input (spec §10, sweep 2)
+  unsigned long long m_out_inflight_bytes = 0;
+  unsigned long long n_out_payload = 0, n_out_hdr = 0, n_in_payload = 0,
+                     n_in_hdr = 0, n_peak_out_inflight_bytes = 0,
+                     n_out_delivered = 0, occ_cycles_out = 0;
   unsigned long long n_out_pkts, n_in_pkts, n_out_bytes, n_in_bytes,
       n_peak_out_q, n_peak_in_q, n_refuse_cycles, n_deliver_stall_cycles;
   double busy_out, busy_in, qwait_out, qwait_in;

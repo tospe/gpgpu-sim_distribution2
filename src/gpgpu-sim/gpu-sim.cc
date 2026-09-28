@@ -385,6 +385,17 @@ void memory_config::reg_options(class OptionParser *opp) {
   option_parser_register(
       opp, "-gpgpu_cam_link_out_queue", OPT_UINT32, &cam_link_out_queue,
       "CAM external outbound queue capacity (packets)", "64");
+  option_parser_register(opp, "-gpgpu_cam_link_window_bytes", OPT_UINT32,
+                         &cam_link_window_bytes,
+                         "CAM external outbound window in wire bytes, occupied "
+                         "from endpoint acceptance to engine delivery (0 = use "
+                         "-gpgpu_cam_link_out_queue packets)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_cam_addr_probe", OPT_CSTR,
+                         &cam_addr_probe,
+                         "CAM diagnostic: print the sub-partition of each hex "
+                         "address in this file (decoded as from TPC 0)",
+                         "");
   option_parser_register(opp, "-dram_latency", OPT_UINT32, &dram_latency,
                          "DRAM latency (default 30)", "30");
   option_parser_register(opp, "-dram_dual_bus_interface", OPT_UINT32,
@@ -1200,6 +1211,17 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
       // core clock for ns -> cycle conversion of external link delays
       const_cast<memory_config *>(m_memory_config)->cam_core_ghz =
           m_config.core_freq / 1e9;
+      if (m_memory_config->cam_addr_probe &&
+          m_memory_config->cam_addr_probe[0]) {
+        FILE *pf = fopen(m_memory_config->cam_addr_probe, "r");
+        unsigned long long a;
+        while (pf && fscanf(pf, "%llx", &a) == 1) {
+          addrdec_t t;
+          m_memory_config->m_address_mapping.addrdec_tlx(a, &t, 0);
+          printf("CAMPROBE 0x%llx sub_partition %u\n", a, t.sub_partition);
+        }
+        if (pf) fclose(pf);
+      }
       m_cam_func = new cam_functional(m_memory_config->cam_func_file);
       m_cam_log = new cam_log(m_memory_config->cam_result_log);
     }

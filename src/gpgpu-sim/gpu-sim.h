@@ -395,6 +395,9 @@ class memory_config {
   unsigned cam_link_hdr_bytes;
   unsigned cam_link_out_queue;  // outbound packets accepted, not delivered
   double cam_core_ghz;          // core clock for ns -> cycles (set at init)
+  unsigned
+      cam_link_window_bytes;  // outbound window in wire bytes (0 = packet mode)
+  char *cam_addr_probe;       // diagnostic: file of addresses to decode
 
   // DRAM parameters
 
