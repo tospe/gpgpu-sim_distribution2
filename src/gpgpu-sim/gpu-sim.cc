@@ -2028,9 +2028,11 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
     for (unsigned i = 0; i < m_memory_config->m_n_mem; i++)
       m_memory_partition_unit[i]->cam_pull_print_stats(stdout);
     if (m_memory_config->cam_placement == 2)
-      printf("cam_poll: polls=%llu poll_insn=%llu satisfied=%llu\n",
-             m_cam_polls, m_cam_polls * m_memory_config->cam_poll_insn,
-             m_cam_polls_ok);
+      printf(
+          "cam_poll: polls=%llu poll_insn=%llu satisfied=%llu "
+          "peak_window_reads_outstanding=%lld\n",
+          m_cam_polls, m_cam_polls * m_memory_config->cam_poll_insn,
+          m_cam_polls_ok, m_pull_rd_peak);
     if (m_cam_log && m_cam_log->on()) fflush(m_cam_log->fp());
   }
 

@@ -664,6 +664,7 @@ class gpgpu_sim : public gpgpu_t {
   unsigned cam_home(new_addr_type addr) const;
   cam_staging_pool *m_cam_staging = NULL;  // one per sub-partition (F5)
   unsigned long long m_cam_polls = 0, m_cam_polls_ok = 0;  // B-pull polls
+  long long m_pull_rd_out = 0, m_pull_rd_peak = 0;  // window reads in flight
   unsigned long long m_last_cam_progress = 0;
   cam_functional *m_cam_func = NULL;
   cam_log *m_cam_log = NULL;

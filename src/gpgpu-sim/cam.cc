@@ -773,6 +773,10 @@ void cam_endpoint::pull_cycle(unsigned long long now) {
       }
       m_engine.push(mf, now);
     } else if (!mf->get_is_write()) {  // result load: data from the device
+      if (m_log && m_log->on())        // served: offset in the window, bytes
+        fprintf(m_log->fp(), "Y,%u,%llu,%llu,%zu\n", mf->get_sid(),
+                (unsigned long long)(mf->get_addr() - m_config->cam_pull_base),
+                now, mf->get_mem_access().get_byte_mask().count());
       mf->set_reply();
       m_ret.push_back(timed_mf{t_ret, mf, e.t_accept});
     } else {  // other window write: acknowledged

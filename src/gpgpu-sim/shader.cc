@@ -1082,6 +1082,7 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
   m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
   func_exec_inst(**pipe_reg);
   if ((*pipe_reg)->is_cam()) cam_issue(warp_id, **pipe_reg);
+  cam_log_window_issue(warp_id, **pipe_reg);  // B-pull: transfer start
 
   // Add LDGSTS instructions into a buffer
   unsigned int ldgdepbar_id = m_warp[warp_id]->m_ldgdepbar_id;
@@ -1352,6 +1353,13 @@ bool shader_core_ctx::check_trywait_ready(const warp_inst_t *pI,
   }
   // Set final acquired state - no need to check again in issue_warp()
   m_warp[warp_id]->set_trywait_acquired(all_acquired);
+  if (all_acquired && m_memory_config->cam_enabled &&
+      m_memory_config->cam_placement == 2) {  // B-pull: consumer readiness
+    cam_log *log = m_gpu->get_cam_log();
+    if (log && log->on())
+      fprintf(log->fp(), "T,%u,%u,%llu\n", m_sid, warp_id,
+              m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+  }
   m_warp[warp_id]->reset_trywait_retries();
   return true;  // Ready to issue
 }
@@ -2589,6 +2597,9 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
                                   m_core->get_gpu()->gpu_sim_cycle +
                                       m_core->get_gpu()->gpu_tot_sim_cycle);
         m_icnt->push(mf);
+        if (mf->m_cam.pull_win && !mf->m_cam.valid &&
+            !mf->get_is_write())  // B-pull statistic: result-window reads
+          m_core->cam_pull_read_out(+1);
         inst.accessq_pop_back();
         // inst.clear_active( access.get_warp_mask() );
         if (inst.is_load()) {
@@ -3123,8 +3134,10 @@ void ldst_unit::writeback() {
           if (m_operand_collector->writeback(m_next_wb)) {
             // B-pull: log each result-load reply from the CAM window
             // (statistics only), so the last load's completion is visible
-            if (mf->m_cam.pull_win && !mf->get_is_write())
+            if (mf->m_cam.pull_win && !mf->m_cam.valid && !mf->get_is_write()) {
               m_core->cam_log_load(mf);
+              m_core->cam_pull_read_out(-1);
+            }
             if (mf->isatomic()) {
               m_core->decrement_atomic_count(
                   mf->get_wid(), mf->get_access_warp_mask().count());
@@ -5228,8 +5241,47 @@ void shader_core_ctx::cam_poll_reply(mem_fetch *mf) {
 void shader_core_ctx::cam_log_load(mem_fetch *mf) {
   cam_log *log = m_gpu->get_cam_log();
   if (!log || !log->on()) return;
-  fprintf(log->fp(), "L,%u,%u,%llu\n", m_sid, mf->get_wid(),
-          m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+  const mem_access_t &a = mf->get_mem_access();
+  fprintf(log->fp(), "L,%u,%u,%llu,%zu,%d\n", m_sid, mf->get_wid(),
+          m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle,
+          a.get_byte_mask().count(), a.is_tma() ? 1 : 0);
+}
+
+// B-pull statistics: result-window reads outstanding from this SM (from
+// injection to writeback), aggregated at the GPU as current and peak
+void shader_core_ctx::cam_pull_read_out(int d) {
+  m_gpu->m_pull_rd_out += d;
+  if (m_gpu->m_pull_rd_out > m_gpu->m_pull_rd_peak)
+    m_gpu->m_pull_rd_peak = m_gpu->m_pull_rd_out;
+}
+
+// B-pull: log the issue of a load (ordinary or TMA) whose first address is in
+// the CAM window (transfer start); statistics only
+void shader_core_ctx::cam_log_window_issue(unsigned warp_id,
+                                           const warp_inst_t &inst) {
+  if (!(m_memory_config->cam_enabled && m_memory_config->cam_placement == 2) ||
+      !inst.is_load() || inst.is_cam())
+    return;
+  new_addr_type a = 0;
+  if (inst.is_tma()) {
+    if (inst.tma_access_addrs().empty()) return;
+    a = inst.tma_access_addrs()[0];
+  } else {
+    unsigned lane = MAX_WARP_SIZE;
+    for (unsigned i = 0; i < MAX_WARP_SIZE; i++)
+      if (inst.active(i)) {
+        lane = i;
+        break;
+      }
+    if (lane == MAX_WARP_SIZE || inst.space.get_type() != global_space) return;
+    a = inst.get_addr(lane);
+  }
+  if (!m_memory_config->cam_pull_in_window(a)) return;
+  cam_log *log = m_gpu->get_cam_log();
+  if (!log || !log->on()) return;
+  fprintf(log->fp(), "I,%u,%u,%llu,%d\n", m_sid, warp_id,
+          m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle,
+          inst.is_tma() ? 1 : 0);
 }
 
 void shader_core_ctx::cam_log_poll(unsigned warp_id, unsigned slot,

@@ -1608,6 +1608,10 @@ class warp_inst_t : public inst_t {
   void set_tma_access_addrs(const std::vector<new_addr_type> &addrs) {
     m_tma_access_addrs = addrs;
   }
+  const std::vector<new_addr_type> &tma_access_addrs() const {
+    return m_tma_access_addrs;
+  }
+
   void set_tma_access_addrs(const std::vector<uint64_t> &addrs) {
     for (const auto &addr : addrs) {
       m_tma_access_addrs.push_back(addr);
