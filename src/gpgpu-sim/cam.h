@@ -202,9 +202,22 @@ class cam_endpoint {
   // service, replies, packets on the link). A command blocked at the head of
   // the input queue is NOT counted, so real deadlocks stay detectable.
   bool busy() const {
-    return m_engine.scheduled_work() || !m_out.empty() || !m_in.empty();
+    return m_engine.scheduled_work() || !m_out.empty() || !m_in.empty() ||
+           !m_fwd.empty() || !m_events.empty() || !m_ret.empty();
   }
-  unsigned long long progress() const { return m_engine.progress(); }
+  unsigned long long progress() const {
+    return m_engine.progress() + n_pull_progress;
+  }
+  // B-pull (placement 2, spec docs/option_b_pull_spec.md): this endpoint is
+  // the uncached pass-through of the CAM window at the home sub-partition; the
+  // memory partition's channel accepts its requests (pull_ready/pull_accept).
+  bool pull() const { return m_pull; }
+  bool pull_ready(unsigned long long now) const {
+    return m_pull && !m_fwd.empty() && m_fwd.front().t <= now;
+  }
+  // accept the head request on the channel at `now`; returns the channel
+  // occupancy in 32 B atoms (DRAM cycles)
+  unsigned pull_accept(unsigned long long now);
   void set_staging(cam_staging_pool *p) { m_engine.set_staging(p); }
   void print_stats(FILE *fp) const;
 
@@ -223,6 +236,28 @@ class cam_endpoint {
   const memory_config *m_config;
   unsigned m_id;
   bool m_external;
+  bool m_pull;
+  cam_log *m_log;
+  struct timed_mf {
+    unsigned long long t;
+    mem_fetch *mf;
+    unsigned long long t_accept;
+  };
+  std::deque<timed_mf> m_fwd;     // waiting for the L2 pass-through + channel
+  std::deque<timed_mf> m_events;  // accepted, reaching the device at t
+  std::deque<timed_mf> m_ret;     // read data back at the sub-partition at t
+  std::map<std::pair<unsigned, unsigned>, unsigned long long> m_status;
+  void pull_cycle(unsigned long long now);
+  void pull_complete(mem_fetch *mf, unsigned long long now);
+
+ public:
+  unsigned long long n_pull_progress = 0, n_pull_acc = 0, n_pull_atoms = 0,
+                     n_pull_qwrite = 0, n_pull_cmd = 0, n_pull_poll = 0,
+                     n_pull_load = 0, n_pull_other = 0, n_pull_ret = 0,
+                     n_pull_dev_stall = 0, n_pull_peak_fwd = 0,
+                     n_pull_status_updates = 0, n_pull_refuse = 0;
+
+ private:
   cam_unit m_engine;
   std::deque<link_pkt> m_out, m_in;
   double m_free_out, m_free_in;

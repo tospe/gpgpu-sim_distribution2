@@ -308,6 +308,11 @@ class shd_warp_t {
   unsigned m_cam_seq;        // next search sequence number of this warp
   unsigned m_cam_wait_kind;  // 0 none, 1 CAMWAIT (done), 2 CAMWAITF (free)
   unsigned m_cam_wait_slot;
+  // B-pull CAMPOLL state (kind 3): next poll time, a poll read in flight,
+  // satisfied, polls issued, and the CAMPOLL instruction (poll reads carry it)
+  unsigned long long m_cam_poll_next = 0, m_cam_polls = 0;
+  bool m_cam_poll_out = false, m_cam_poll_ok = false;
+  std::shared_ptr<warp_inst_t> m_cam_poll_inst;
   // F5: bytes of the current query already issued as UCAMQ chunks
   unsigned long long m_cam_q_bytes = 0;
   unsigned m_cam_wait_count;
@@ -2828,6 +2833,12 @@ class shader_core_ctx : public core_t {
   // F5: may this UCAMQ issue (a query's first chunk needs a staging
   // reservation at the home unit)?
   bool cam_staging_ok(unsigned warp_id, const warp_inst_t &inst);
+  // B-pull: issue due status polls (each a real 32 B read, charged) and handle
+  // their replies
+  void cam_poll_cycle();
+  void cam_poll_reply(mem_fetch *mf);
+  void cam_log_poll(unsigned warp_id, unsigned slot, unsigned count,
+                    unsigned long long t_issue, unsigned long long polls);
   void cam_complete(class mem_fetch *mf);
   void cam_packet(class mem_fetch *mf);
   void cam_log_wait(unsigned warp_id, unsigned kind, unsigned slot,

@@ -295,6 +295,49 @@ void memory_partition_unit::simple_dram_model_cycle() {
     }
   }
 
+  // B-pull (spec docs/option_b_pull_spec.md §6): the channel accepts one 32 B
+  // transaction per DRAM cycle; a CAM-window request occupies ceil(bytes/32)
+  // cycles. Work-conserving round-robin per transaction between the CAM class
+  // and the DRAM class when both are ready (a documented policy, not measured
+  // hardware). No read/write turnaround (as the calibrated simple model).
+  if (m_config->cam_enabled && m_config->cam_placement == 2) {
+    const unsigned long long now =
+        m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
+    n_pull_dram_cycles++;
+    if (m_pull_busy) {  // channel still transferring a CAM request
+      m_pull_busy--;
+      n_pull_busy_cycles++;
+      return;
+    }
+    cam_endpoint *pe = NULL;
+    for (unsigned p = 0; p < m_config->m_n_sub_partition_per_memory_channel;
+         p++)
+      if (m_sub_partition[p]->m_cam &&
+          m_sub_partition[p]->m_cam->pull_ready(now)) {
+        pe = m_sub_partition[p]->m_cam;
+        break;
+      }
+    bool dram_ready = false;
+    for (unsigned p = 0; p < m_config->m_n_sub_partition_per_memory_channel;
+         p++)
+      if (!m_sub_partition[p]->L2_dram_queue_empty() && can_issue_to_dram(p) &&
+          !m_dram->full(m_sub_partition[p]->L2_dram_queue_top()->is_write()))
+        dram_ready = true;
+    if (pe && dram_ready) n_pull_both_ready++;
+    if (pe && (!dram_ready || m_pull_rr_cam)) {
+      const unsigned atoms = pe->pull_accept(now);
+      m_pull_busy = atoms - 1;
+      n_pull_busy_cycles++;
+      n_pull_grants_cam++;
+      if (dram_ready) m_pull_rr_cam = false;
+      return;
+    }
+    if (dram_ready) {
+      n_pull_grants_dram++;
+      if (pe) m_pull_rr_cam = true;
+    }
+  }
+
   // mem_fetch *mf = m_sub_partition[spid]->L2_dram_queue_top();
   // if( !m_dram->full(mf->is_write()) ) {
   // L2->DRAM queue to DRAM latency queue
@@ -935,7 +978,7 @@ memory_sub_partition::breakdown_request_to_sector_requests(mem_fetch *mf) {
 }
 
 void memory_sub_partition::push(mem_fetch *m_req, unsigned long long cycle) {
-  if (m_req && m_req->m_cam.valid) {
+  if (m_req && (m_req->m_cam.valid || m_req->m_cam.pull_win)) {
     // CAM extension: CAM requests go to the CAM unit, bypassing the ROP
     // queue, sector breakdown and LRC (the CAM is not a cache).
     assert(m_cam);
@@ -1253,4 +1296,15 @@ void memory_sub_partition::forward_write_to_peer_chiplet(mem_fetch *mf) {
   }
   m_chiplet_icnt.to_peer_request()->push(new_mf);
   ++m_stats->interchip_write_requests;
+}
+
+void memory_partition_unit::cam_pull_print_stats(FILE *fp) const {
+  if (!(m_config->cam_enabled && m_config->cam_placement == 2) ||
+      !n_pull_grants_cam)
+    return;
+  fprintf(fp,
+          "cam_pull_channel[%u]: dram_cycles=%llu cam_busy_cycles=%llu "
+          "grants_cam=%llu grants_dram=%llu both_ready=%llu\n",
+          m_id, n_pull_dram_cycles, n_pull_busy_cycles, n_pull_grants_cam,
+          n_pull_grants_dram, n_pull_both_ready);
 }

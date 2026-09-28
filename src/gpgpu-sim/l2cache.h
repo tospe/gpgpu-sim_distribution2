@@ -251,6 +251,13 @@ class memory_partition_unit {
   void cache_cycle(unsigned cycle);
   void dram_cycle();
   void simple_dram_model_cycle();
+  // B-pull channel arbitration state/statistics (spec option B §6)
+  unsigned m_pull_busy = 0;
+  bool m_pull_rr_cam = true;
+  unsigned long long n_pull_dram_cycles = 0, n_pull_busy_cycles = 0,
+                     n_pull_grants_cam = 0, n_pull_grants_dram = 0,
+                     n_pull_both_ready = 0;
+  void cam_pull_print_stats(FILE *fp) const;
 
   void set_done(mem_fetch *mf);
 

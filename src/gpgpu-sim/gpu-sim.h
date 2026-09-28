@@ -220,6 +220,9 @@ class memory_config {
     gpgpu_ctx = ctx;
   }
   void init(const shader_core_config *shader_config = nullptr) {
+    cam_pull_base = cam_pull_base_str
+                        ? (new_addr_type)strtoull(cam_pull_base_str, NULL, 16)
+                        : 0;
     assert(gpgpu_dram_timing_opt);
     if (strchr(gpgpu_dram_timing_opt, '=') == NULL) {
       // dram timing option in ordered variables (legacy)
@@ -401,6 +404,15 @@ class memory_config {
   unsigned cam_output_buffer_bytes;  // CAM output buffer (result bytes), F2
   unsigned cam_link_rx_bytes;  // external: inbound in-flight + endpoint receive
   unsigned cam_staging_bytes;
+  // B-pull (placement 2; spec docs/option_b_pull_spec.md)
+  char *cam_pull_base_str;
+  new_addr_type cam_pull_base = 0;
+  unsigned cam_pull_window_bytes, cam_pull_status_offset, cam_pull_queue,
+      cam_poll_interval_ns, cam_poll_loop_cycles, cam_poll_insn;
+  bool cam_pull_in_window(new_addr_type a) const {
+    return cam_enabled && cam_placement == 2 && a >= cam_pull_base &&
+           a < cam_pull_base + cam_pull_window_bytes;
+  }
   // bytes
 
   // DRAM parameters
@@ -651,6 +663,7 @@ class gpgpu_sim : public gpgpu_t {
   cam_staging_pool *cam_staging(unsigned sub_partition);
   unsigned cam_home(new_addr_type addr) const;
   cam_staging_pool *m_cam_staging = NULL;  // one per sub-partition (F5)
+  unsigned long long m_cam_polls = 0, m_cam_polls_ok = 0;  // B-pull polls
   unsigned long long m_last_cam_progress = 0;
   cam_functional *m_cam_func = NULL;
   cam_log *m_cam_log = NULL;

@@ -85,6 +85,13 @@ mem_fetch::mem_fetch(const mem_access_t &access, const warp_inst_t *inst,
     config->m_address_mapping.addrdec_tlx(access.get_addr(), &m_raw_addr, 0);
     m_cam.valid = true;
   }
+  if (config->cam_pull_in_window(access.get_addr())) {
+    // B-pull: the whole CAM window maps to the channel of the CAM base's home
+    // sub-partition (address-map carve-out, spec option B §1)
+    config->m_address_mapping.addrdec_tlx(config->cam_pull_base, &m_raw_addr,
+                                          0);
+    m_cam.pull_win = true;
+  }
   if (config->n_chiplet > 1) {
     m_dest_chiplet = config->get_dest_chiplet(access.get_addr());
     m_src_chiplet = config->get_src_chiplet(tpc);
@@ -137,6 +144,13 @@ mem_fetch::mem_fetch(const mem_access_t &access,
     // SM reaches the same (home) sub-partition regardless of chiplet folding.
     config->m_address_mapping.addrdec_tlx(access.get_addr(), &m_raw_addr, 0);
     m_cam.valid = true;
+  }
+  if (config->cam_pull_in_window(access.get_addr())) {
+    // B-pull: the whole CAM window maps to the channel of the CAM base's home
+    // sub-partition (address-map carve-out, spec option B §1)
+    config->m_address_mapping.addrdec_tlx(config->cam_pull_base, &m_raw_addr,
+                                          0);
+    m_cam.pull_win = true;
   }
   if (config->n_chiplet > 1) {
     m_dest_chiplet = config->get_dest_chiplet(access.get_addr());

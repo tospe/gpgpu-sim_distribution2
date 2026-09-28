@@ -412,6 +412,37 @@ void memory_config::reg_options(class OptionParser *opp) {
                          "chunk and releases it at admission (0 = unbounded, "
                          "legacy) (hypothetical)",
                          "0");
+  option_parser_register(opp, "-gpgpu_cam_pull_base", OPT_CSTR,
+                         &cam_pull_base_str,
+                         "B-pull: CAM window base address (hex)", "0xC0DE0000");
+  option_parser_register(opp, "-gpgpu_cam_pull_window_bytes", OPT_UINT32,
+                         &cam_pull_window_bytes,
+                         "B-pull: CAM window size in bytes", "1048576");
+  option_parser_register(opp, "-gpgpu_cam_pull_status_offset", OPT_UINT32,
+                         &cam_pull_status_offset,
+                         "B-pull: offset of the status words in the window "
+                         "(32 B per slot)",
+                         "262144");
+  option_parser_register(opp, "-gpgpu_cam_pull_queue", OPT_UINT32,
+                         &cam_pull_queue,
+                         "B-pull: CAM request-class queue entries at the "
+                         "memory partition (hypothetical)",
+                         "32");
+  option_parser_register(opp, "-gpgpu_cam_poll_interval_ns", OPT_UINT32,
+                         &cam_poll_interval_ns,
+                         "B-pull: NANOSLEEP between a negative poll reply and "
+                         "the next poll (hypothetical)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_cam_poll_loop_cycles", OPT_UINT32,
+                         &cam_poll_loop_cycles,
+                         "B-pull: core cycles from a poll reply to the next "
+                         "poll issue (compare, branch; hypothetical)",
+                         "4");
+  option_parser_register(opp, "-gpgpu_cam_poll_insn", OPT_UINT32,
+                         &cam_poll_insn,
+                         "B-pull: instructions charged per poll iteration "
+                         "(load, compare, branch, nanosleep)",
+                         "4");
   option_parser_register(opp, "-gpgpu_cam_addr_probe", OPT_CSTR,
                          &cam_addr_probe,
                          "CAM diagnostic: print the sub-partition of each hex "
@@ -1994,6 +2025,12 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
   if (m_memory_config->cam_enabled) {
     for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++)
       m_memory_sub_partition[i]->cam_print_stats(stdout);
+    for (unsigned i = 0; i < m_memory_config->m_n_mem; i++)
+      m_memory_partition_unit[i]->cam_pull_print_stats(stdout);
+    if (m_memory_config->cam_placement == 2)
+      printf("cam_poll: polls=%llu poll_insn=%llu satisfied=%llu\n",
+             m_cam_polls, m_cam_polls * m_memory_config->cam_poll_insn,
+             m_cam_polls_ok);
     if (m_cam_log && m_cam_log->on()) fflush(m_cam_log->fp());
   }
 

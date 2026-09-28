@@ -101,6 +101,10 @@ class mem_fetch {
     // packet's release by the engine and its arrival back at the endpoint
     unsigned long long t_endpoint = 0, t_last_ready = 0, t_last_ep = 0;
     unsigned out_bytes = 0;  // result bytes held in the CAM output buffer (F2)
+    // B-pull (placement 2): an access to the CAM window (any type), a status
+    // poll, and the status value the device returned for a poll
+    bool pull_win = false, poll = false;
+    unsigned long long status_val = 0;
   } m_cam;
   std::shared_ptr<warp_inst_t> get_inst_ptr() const { return m_inst; }
 

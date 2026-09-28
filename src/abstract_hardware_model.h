@@ -1472,7 +1472,10 @@ enum cam_op_t {
   CAM_OP_SEARCH,  // UCAMS.ASYNC.BE.K<k>.DSA: submit search (imm = slot)
   CAM_OP_WAIT,    // CAMWAIT: until done[slot] >= n (imm = slot << 16 | n)
   CAM_OP_WAITF,   // CAMWAITF: until free[slot] >= n (imm = slot << 16 | n)
-  CAM_OP_REL      // CAMREL: free[slot] += 1 (imm = slot)
+  CAM_OP_REL,     // CAMREL: free[slot] += 1 (imm = slot)
+  CAM_OP_POLL     // CAMPOLL (B-pull): poll the device status of slot until
+                  // it reaches n (imm = slot << 16 | n); every poll is a
+                  // real read and is charged
 };
 
 class warp_inst_t : public inst_t {

@@ -3102,6 +3102,13 @@ void ldst_unit::writeback() {
         assert(m_next_global.size() <= m_config->m_L1D_config.l1_banks);
         while (!m_next_global.empty()) {
           mem_fetch *mf = m_next_global.front();
+          if (mf->m_cam.valid && mf->m_cam.poll) {  // B-pull status poll
+            m_core->cam_poll_reply(mf);
+            m_next_global.pop_front();
+            delete mf;
+            serviced_client = next_client;
+            continue;
+          }
           if (mf->m_cam.valid) {
             // CAM reply: result bytes land in the CTA result buffer; only the
             // last packet completes the request (no register writeback).
@@ -4600,6 +4607,7 @@ void shader_core_ctx::cycle() {
   execute();
   read_operands();
   issue();
+  cam_poll_cycle();  // B-pull status polls (no-op unless placement 2)
   for (unsigned int i = 0; i < m_config->inst_fetch_throughput; ++i) {
     decode();
     fetch();
@@ -5071,10 +5079,18 @@ void shader_core_ctx::cam_issue(unsigned warp_id, warp_inst_t &inst) {
             inst.m_cam_slot, m_memory_config->cam_slots);
     abort();
   }
+  const bool pull = m_memory_config->cam_placement == 2;
+  if (inst.m_cam_op == CAM_OP_POLL && !pull) {
+    fprintf(stderr, "GPGPU-Sim CAM: CAMPOLL needs -gpgpu_cam_placement 2\n");
+    abort();
+  }
   // Slot ownership rule (spec §6a): at submission, no request of this slot is
-  // in flight and every previous use has been released.
-  if (inst.m_cam_op == CAM_OP_SEARCH || inst.m_cam_op == CAM_OP_FILL ||
-      inst.m_cam_op == CAM_OP_WRITE) {
+  // in flight and every previous use has been released. B-pull: slots name
+  // device result buffers; completion is observed by polling, not counted
+  // here, so the rule and the outstanding count do not apply.
+  if (!pull &&
+      (inst.m_cam_op == CAM_OP_SEARCH || inst.m_cam_op == CAM_OP_FILL ||
+       inst.m_cam_op == CAM_OP_WRITE)) {
     const unsigned s = inst.m_cam_slot;
     const unsigned long long sub = m_cam_sub[cta][s], done = m_cam_done[cta][s],
                              freed = m_cam_free[cta][s];
@@ -5106,12 +5122,25 @@ void shader_core_ctx::cam_issue(unsigned warp_id, warp_inst_t &inst) {
       inst.m_cam_seq = w->m_cam_seq++;
       inst.m_cam_qready = w->m_cam_qstart ? w->m_cam_qstart : now;
       w->m_cam_qstart = 0;
-      w->m_cam_outstanding++;
+      if (!pull) w->m_cam_outstanding++;
       break;
     case CAM_OP_FILL:
     case CAM_OP_WRITE:
-      w->m_cam_outstanding++;
+      if (!pull) w->m_cam_outstanding++;
       break;
+    case CAM_OP_POLL: {
+      w->m_cam_wait_kind = 3;
+      w->m_cam_wait_slot = inst.m_cam_slot;
+      w->m_cam_wait_count = inst.m_cam_count;
+      w->m_cam_wait_issue = now;
+      w->m_cam_poll_next = now;  // first poll right away
+      w->m_cam_poll_out = false;
+      w->m_cam_poll_ok = false;
+      w->m_cam_polls = 0;
+      w->m_cam_poll_inst = std::make_shared<warp_inst_t>(inst);
+      w->m_cam_poll_inst->cache_op = CACHE_GLOBAL;  // uncached (L1 bypass)
+      break;
+    }
     case CAM_OP_WAIT:
     case CAM_OP_WAITF:
       w->m_cam_wait_kind = inst.m_cam_op == CAM_OP_WAIT ? 1 : 2;
@@ -5142,6 +5171,64 @@ bool shader_core_ctx::cam_staging_ok(unsigned warp_id,
   if (!p || p->can_reserve(q)) return true;
   p->n_wait++;  // issue attempts held for a staging reservation
   return false;
+}
+
+// B-pull (spec option B §4): a warp waiting at CAMPOLL issues one 32 B status
+// read at a time, through the normal memory interface (it waits for injection
+// space like any access). Each iteration is charged cam_poll_insn instructions
+// (counted; issue-slot competition with other warps is not modelled) and a
+// real read on the shared channel. A negative reply schedules the next poll
+// after the loop cycles plus the NANOSLEEP interval.
+void shader_core_ctx::cam_poll_cycle() {
+  if (!(m_memory_config->cam_enabled && m_memory_config->cam_placement == 2))
+    return;
+  const unsigned long long now =
+      m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
+  for (unsigned i = 0; i < m_warp.size(); i++) {
+    shd_warp_t *w = m_warp[i];
+    if (w->m_cam_wait_kind != 3 || w->m_cam_poll_out || w->m_cam_poll_ok ||
+        now < w->m_cam_poll_next)
+      continue;
+    const new_addr_type a = m_memory_config->cam_pull_base +
+                            m_memory_config->cam_pull_status_offset +
+                            32ULL * w->m_cam_wait_slot;
+    mem_access_t acc(CAM_ACC_R, a, 32, false, m_gpu->gpgpu_ctx);
+    if (m_icnt->full(32 + READ_PACKET_SIZE, false)) continue;
+    mem_fetch *mf = m_mem_fetch_allocator->alloc(w->m_cam_poll_inst, acc, now);
+    mf->m_cam.poll = true;
+    m_icnt->push(mf);
+    w->m_cam_poll_out = true;
+    w->m_cam_polls++;
+    m_gpu->m_cam_polls++;
+  }
+}
+
+void shader_core_ctx::cam_poll_reply(mem_fetch *mf) {
+  shd_warp_t *w = m_warp[mf->get_wid()];
+  assert(w->m_cam_wait_kind == 3 && w->m_cam_poll_out);
+  w->m_cam_poll_out = false;
+  const unsigned long long now =
+      m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
+  if (mf->m_cam.status_val >= w->m_cam_wait_count) {
+    w->m_cam_poll_ok = true;
+    m_gpu->m_cam_polls_ok++;
+  } else {
+    const unsigned long long sleep =
+        (unsigned long long)(m_memory_config->cam_poll_interval_ns *
+                                 m_memory_config->cam_core_ghz +
+                             0.5);
+    w->m_cam_poll_next = now + m_memory_config->cam_poll_loop_cycles + sleep;
+  }
+}
+
+void shader_core_ctx::cam_log_poll(unsigned warp_id, unsigned slot,
+                                   unsigned count, unsigned long long t_issue,
+                                   unsigned long long polls) {
+  cam_log *log = m_gpu->get_cam_log();
+  if (!log || !log->on()) return;
+  fprintf(log->fp(), "P,%u,%u,%u,%u,%llu,%llu,%llu\n", m_sid, warp_id, slot,
+          count, t_issue, m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle,
+          polls);
 }
 
 // Every CAM reply packet at LDST writeback (records the first packet's time).
@@ -5247,7 +5334,15 @@ bool shd_warp_t::waiting() {
   waiting |= m_waiting_ldgsts;
   // CAM extension: CAMWAIT / CAMWAITF on a per-CTA completion slot counter.
   // Re-evaluated every cycle against the counter; no polling traffic.
-  if (m_cam_wait_kind) {
+  if (m_cam_wait_kind == 3) {  // B-pull CAMPOLL: released by a poll reply
+    if (m_cam_poll_ok) {
+      m_shader->cam_log_poll(m_warp_id, m_cam_wait_slot, m_cam_wait_count,
+                             m_cam_wait_issue, m_cam_polls);
+      m_cam_wait_kind = 0;
+    } else {
+      waiting = true;
+    }
+  } else if (m_cam_wait_kind) {
     if (m_shader->cam_counter(m_cta_id, m_cam_wait_kind, m_cam_wait_slot) >=
         m_cam_wait_count) {
       m_shader->cam_log_wait(m_warp_id, m_cam_wait_kind, m_cam_wait_slot,

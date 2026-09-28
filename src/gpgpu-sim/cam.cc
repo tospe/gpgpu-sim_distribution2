@@ -457,6 +457,8 @@ cam_endpoint::cam_endpoint(const memory_config *config,
     : m_config(config),
       m_id(sub_partition_id),
       m_external(config->cam_placement == 1),
+      m_pull(config->cam_placement == 2),
+      m_log(log),
       m_engine(config, sub_partition_id, func, log),
       m_free_out(0),
       m_free_in(0),
@@ -472,7 +474,12 @@ cam_endpoint::cam_endpoint(const memory_config *config,
       busy_in(0),
       qwait_out(0),
       qwait_in(0) {
-  assert(config->cam_placement <= 1);
+  assert(config->cam_placement <= 2);
+  if (m_pull && !config->simple_dram_model) {
+    fprintf(stderr,
+            "GPGPU-Sim CAM: B-pull requires -gpgpu_simple_dram_model 1\n");
+    abort();
+  }
   if (m_external &&
       config->cam_link_rx_bytes < wire_bytes(config->cam_result_pkt_bytes)) {
     fprintf(stderr,
@@ -489,6 +496,7 @@ cam_endpoint::cam_endpoint(const memory_config *config,
 // is accepted only if its wire bytes fit in the remaining window. A packet
 // occupies the window from acceptance until delivery into the engine input.
 bool cam_endpoint::full() const {
+  if (m_pull) return m_fwd.size() >= m_config->cam_pull_queue;
   if (!m_external) return m_engine.full();
   if (m_config->cam_link_window_bytes)
     return m_out_inflight_bytes + wire_bytes(32) >
@@ -550,6 +558,12 @@ double cam_endpoint::cross(bool outbound, unsigned payload, double t_ready,
 
 void cam_endpoint::push(mem_fetch *mf, unsigned long long now) {
   mf->m_cam.t_endpoint = now;
+  if (m_pull) {  // uncached pass-through: the L2 pipeline (ROP) latency
+    m_fwd.push_back(timed_mf{now + m_config->rop_latency, mf, 0});
+    if (m_fwd.size() > n_pull_peak_fwd) n_pull_peak_fwd = m_fwd.size();
+    n_pull_progress++;
+    return;
+  }
   if (!m_external) {
     m_engine.push(mf, now);
     return;
@@ -565,6 +579,11 @@ void cam_endpoint::push(mem_fetch *mf, unsigned long long now) {
 }
 
 void cam_endpoint::cycle(unsigned long long now) {
+  if (m_pull) {
+    if (full()) n_pull_refuse++;
+    pull_cycle(now);
+    return;
+  }
   if (m_external) {
     if (full()) n_refuse_cycles++;
     while (!m_out.empty() && usable(m_out.front().arrive) <= now) {
@@ -586,6 +605,8 @@ void cam_endpoint::cycle(unsigned long long now) {
 }
 
 mem_fetch *cam_endpoint::top(unsigned long long now) {
+  if (m_pull)
+    return (!m_ret.empty() && m_ret.front().t <= now) ? m_ret.front().mf : NULL;
   // results due by now form packets before this cycle's reply injection
   m_engine.readout_advance(now);
   if (!m_external) {
@@ -633,6 +654,12 @@ mem_fetch *cam_endpoint::top(unsigned long long now) {
 }
 
 void cam_endpoint::pop() {
+  if (m_pull) {
+    m_ret.pop_front();
+    n_pull_ret++;
+    n_pull_progress++;
+    return;
+  }
   if (m_external) {
     m_rx_bytes -= m_in.front().wire;  // injected into the GPU network
     m_in.pop_front();
@@ -643,11 +670,22 @@ void cam_endpoint::pop() {
 
 bool cam_endpoint::saw_traffic() const {
   return m_engine.n_searches || m_engine.n_fills || m_engine.n_writes ||
-         m_engine.n_qpush;
+         m_engine.n_qpush || n_pull_acc;
 }
 
 void cam_endpoint::print_stats(FILE *fp) const {
   m_engine.print_stats(fp);
+  if (m_pull) {
+    fprintf(fp,
+            "cam_pull[%u]: accepted=%llu atoms=%llu qwrite=%llu cmd=%llu "
+            "poll=%llu load=%llu other=%llu returns=%llu dev_stall=%llu "
+            "peak_fwd=%llu status_updates=%llu refuse_cycles=%llu\n",
+            m_id, n_pull_acc, n_pull_atoms, n_pull_qwrite, n_pull_cmd,
+            n_pull_poll, n_pull_load, n_pull_other, n_pull_ret,
+            n_pull_dev_stall, n_pull_peak_fwd, n_pull_status_updates,
+            n_pull_refuse);
+    return;
+  }
   fprintf(fp,
           "cam_endpoint[%u]: placement=%s refuse_cycles=%llu "
           "deliver_stall_cycles=%llu",
@@ -675,4 +713,114 @@ void cam_endpoint::print_stats(FILE *fp) const {
         n_in_payload, n_in_hdr, n_in_bytes, n_peak_out_inflight_bytes,
         n_out_delivered ? (double)occ_cycles_out / n_out_delivered : 0.0);
   fprintf(fp, "\n");
+}
+
+// ------------------------------------------------------------------ B-pull
+// Channel acceptance (called by the memory partition's arbitration, one
+// transaction per free DRAM cycle): the request occupies ceil(bytes / 32) DRAM
+// cycles of the shared channel, reaches the device half a DRAM round trip
+// later, and read data return one DRAM round trip after acceptance (the simple
+// DRAM model's fixed latency; device access time assumed equal, [A]).
+unsigned cam_endpoint::pull_accept(unsigned long long now) {
+  assert(pull_ready(now));
+  mem_fetch *mf = m_fwd.front().mf;
+  m_fwd.pop_front();
+  const unsigned bytes = std::max(1u, mf->get_data_size());
+  const unsigned atoms = (bytes + 31) / 32;
+  n_pull_acc++;
+  n_pull_atoms += atoms;
+  n_pull_progress++;
+  if (mf->m_cam.poll)
+    n_pull_poll++;
+  else if (mf->m_cam.valid && mf->get_inst().m_cam_op == CAM_OP_QPUSH)
+    n_pull_qwrite++;
+  else if (mf->m_cam.valid)
+    n_pull_cmd++;
+  else if (!mf->get_is_write())
+    n_pull_load++;
+  else
+    n_pull_other++;
+  m_events.push_back(timed_mf{now + m_config->dram_latency / 2, mf, now});
+  return atoms;
+}
+
+void cam_endpoint::pull_cycle(unsigned long long now) {
+  // requests reaching the device, in acceptance order
+  while (!m_events.empty() && m_events.front().t <= now) {
+    timed_mf e = m_events.front();
+    mem_fetch *mf = e.mf;
+    const unsigned long long t_ret = std::max(
+        e.t_accept + m_config->dram_latency, now + m_config->dram_latency / 2);
+    if (mf->m_cam.poll) {  // status read: sampled when the device serves it
+      mf->m_cam.status_val =
+          m_status[std::make_pair(mf->get_sid(), mf->get_inst().m_cam_slot)];
+      mf->set_reply();
+      m_ret.push_back(timed_mf{t_ret, mf, e.t_accept});
+    } else if (mf->m_cam.valid) {  // query chunk, command, fill: into the
+      if (m_engine.full()) {       // device (posted writes: no reply)
+        n_pull_dev_stall++;
+        break;
+      }
+      m_engine.push(mf, now);
+    } else if (!mf->get_is_write()) {  // result load: data from the device
+      mf->set_reply();
+      m_ret.push_back(timed_mf{t_ret, mf, e.t_accept});
+    } else {  // other window write: acknowledged
+      mf->set_reply();
+      m_ret.push_back(timed_mf{t_ret, mf, e.t_accept});
+    }
+    m_events.pop_front();
+    n_pull_progress++;
+  }
+  m_engine.cycle(now);
+  m_engine.readout_advance(now);
+  // engine output goes into the device result buffers (write rate assumed not
+  // limiting, [A]); a search's last packet or a fill/write ack updates the
+  // status word of its (SM, slot)
+  while (m_engine.has_reply() && m_engine.next_reply_time() <= now) {
+    mem_fetch *mf = m_engine.top(now);
+    m_engine.pop();
+    const warp_inst_t &inst = mf->get_inst();
+    const bool last =
+        inst.m_cam_op != CAM_OP_SEARCH || mf->m_cam.frag + 1 == mf->m_cam.nfrag;
+    if (last) pull_complete(mf, now);
+    delete mf;
+  }
+}
+
+// status visible: the device has written the last result (or finished the
+// fill/write). Logged here; the SM logs when a poll observes it (P record).
+void cam_endpoint::pull_complete(mem_fetch *mf, unsigned long long now) {
+  const warp_inst_t &inst = mf->get_inst();
+  m_status[std::make_pair(mf->get_sid(), inst.m_cam_slot)]++;
+  n_pull_status_updates++;
+  if (!m_log || !m_log->on()) return;
+  if (inst.m_cam_op == CAM_OP_SEARCH) {
+    std::vector<std::pair<int, float>> res;
+    m_log->take(mf->m_cam.req_id, res);
+    fprintf(m_log->fp(),
+            "S,%llu,%u,%u,%u,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%zu",
+            mf->m_cam.req_id, mf->get_sid(), mf->get_wid(),
+            inst.get_cuda_cta_id().x, inst.m_cam_warp_in_cta, inst.m_cam_seq,
+            inst.m_cam_slot, (unsigned long long)inst.get_issue_cycle(),
+            mf->m_cam.t_arrive, mf->m_cam.t_admit, mf->m_cam.t_first, now,
+            res.size());
+    for (auto &r : res) fprintf(m_log->fp(), ",%d", r.first);
+    for (auto &r : res) fprintf(m_log->fp(), ",%.9g", r.second);
+    fprintf(m_log->fp(), "\n");
+    // X: endpoint = arrival at the home slice; last_ready = last_ep =
+    // complete = status visible at the device; first_sm n/a (0)
+    fprintf(m_log->fp(),
+            "X,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            mf->m_cam.req_id, inst.m_cam_qready,
+            (unsigned long long)inst.get_issue_cycle(), mf->m_cam.t_endpoint,
+            mf->m_cam.t_arrive, mf->m_cam.t_admit, mf->m_cam.t_first, now, now,
+            0ULL, now);
+  } else {
+    fprintf(m_log->fp(), "F,%u,%u,%u,%u,%u,%llu,%llu,%llu\n", mf->get_sid(),
+            mf->get_wid(), inst.m_cam_slot, inst.m_cam_row,
+            inst.m_cam_op == CAM_OP_FILL ? inst.m_cam_rows : 1,
+            (unsigned long long)inst.get_issue_cycle(), mf->m_cam.t_arrive,
+            now);
+  }
 }
