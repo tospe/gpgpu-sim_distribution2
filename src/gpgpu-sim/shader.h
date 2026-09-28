@@ -2837,6 +2837,7 @@ class shader_core_ctx : public core_t {
   // their replies
   void cam_poll_cycle();
   void cam_poll_reply(mem_fetch *mf);
+  void cam_log_load(mem_fetch *mf);
   void cam_log_poll(unsigned warp_id, unsigned slot, unsigned count,
                     unsigned long long t_issue, unsigned long long polls);
   void cam_complete(class mem_fetch *mf);

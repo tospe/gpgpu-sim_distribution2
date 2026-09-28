@@ -3121,6 +3121,10 @@ void ldst_unit::writeback() {
           }
           m_next_wb = mf->get_inst();
           if (m_operand_collector->writeback(m_next_wb)) {
+            // B-pull: log each result-load reply from the CAM window
+            // (statistics only), so the last load's completion is visible
+            if (mf->m_cam.pull_win && !mf->get_is_write())
+              m_core->cam_log_load(mf);
             if (mf->isatomic()) {
               m_core->decrement_atomic_count(
                   mf->get_wid(), mf->get_access_warp_mask().count());
@@ -5219,6 +5223,13 @@ void shader_core_ctx::cam_poll_reply(mem_fetch *mf) {
                              0.5);
     w->m_cam_poll_next = now + m_memory_config->cam_poll_loop_cycles + sleep;
   }
+}
+
+void shader_core_ctx::cam_log_load(mem_fetch *mf) {
+  cam_log *log = m_gpu->get_cam_log();
+  if (!log || !log->on()) return;
+  fprintf(log->fp(), "L,%u,%u,%llu\n", m_sid, mf->get_wid(),
+          m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
 }
 
 void shader_core_ctx::cam_log_poll(unsigned warp_id, unsigned slot,
