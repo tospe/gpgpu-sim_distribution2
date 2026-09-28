@@ -2867,11 +2867,11 @@ bool gpgpu_sim::handle_mf_reply(unsigned subpartition_id, mem_fetch *mf,
     mf->set_status(IN_ICNT_TO_SHADER, gpu_sim_cycle + gpu_tot_sim_cycle);
     ::icnt_push(m_shader_config->mem2device(subpartition_id), mf->get_tpc(), mf,
                 response_size);
-    // P1 counters (statistics only)
+    // P1 counters (statistics only); flits at the network's flit size, as the
+    // interconnect serializes them (the booksim config, not icnt_flit_size)
     memory_sub_partition *sp = m_memory_sub_partition[subpartition_id];
-    const unsigned flits =
-        (response_size + m_memory_config->icnt_flit_size - 1) /
-        m_memory_config->icnt_flit_size;
+    const unsigned fs = ::icnt_get_flit_size();
+    const unsigned flits = (response_size + fs - 1) / fs;
     if (mf->m_cam.valid || mf->get_access_type() == CAM_ACC_R ||
         mf->get_access_type() == CAM_ACC_W) {
       sp->n_rep_cam++;
