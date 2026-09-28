@@ -207,8 +207,9 @@ void cam_unit::start_search(mem_fetch *mf, unsigned long long now) {
     m_log->stash(req_id, res);
   }
 
-  // Readout: first result selected at max(now + L, port free), then one per
-  // topk cycles; a packet leaves when its last result is selected.
+  // Readout: first result selected at max(now + L, port free); result i at
+  // t0 + floor(i / R) * topk (R results per readout step, spec §10); a packet
+  // leaves when its last result is selected. R = 1 is the v1 behaviour.
   const unsigned entry = m_config->cam_result_entry_bytes;
   const unsigned per_pkt = std::max(1u, m_config->cam_result_pkt_bytes / entry);
   const unsigned npkt = (k + per_pkt - 1) / per_pkt;
@@ -216,8 +217,12 @@ void cam_unit::start_search(mem_fetch *mf, unsigned long long now) {
   const unsigned long long t0 = std::max(want, m_readout_free);
   n_readout_wait_cycles += t0 - want;
   const unsigned topk = m_config->cam_topk_latency;
-  m_readout_free = t0 + (unsigned long long)k * topk;
-  const unsigned long long t_last = t0 + (unsigned long long)(k - 1) * topk;
+  const unsigned R = std::max(1u, m_config->cam_readout_per_cycle);
+  auto sel = [&](unsigned i) {
+    return t0 + (unsigned long long)(i / R) * topk;
+  };
+  m_readout_free = t0 + (unsigned long long)((k + R - 1) / R) * topk;
+  const unsigned long long t_last = sel(k - 1);
   m_in_service.insert(t_last);
   if (m_in_service.size() > n_peak_in_service)
     n_peak_in_service = m_in_service.size();
@@ -234,11 +239,12 @@ void cam_unit::start_search(mem_fetch *mf, unsigned long long now) {
     f->m_cam.frag = j;
     f->m_cam.nfrag = npkt;
     f->m_cam.req_id = req_id;
+    f->m_cam.t_endpoint = mf->m_cam.t_endpoint;
     f->m_cam.t_arrive = mf->m_cam.t_arrive;
     f->m_cam.t_admit = now;
     f->m_cam.t_first = t0;
     f->set_reply();
-    emit(f, t0 + (unsigned long long)last_idx * topk);
+    emit(f, sel(last_idx));
     n_result_pkts++;
   }
   delete mf;
@@ -345,4 +351,159 @@ void cam_unit::print_stats(FILE *fp) const {
           n_qpush_bytes, n_result_pkts, n_peak_in_service, n_ii_wait_cycles,
           n_admit_wait_query, n_admit_wait_outstanding, n_admit_wait_mutation,
           n_readout_wait_cycles, n_input_full_cycles);
+}
+
+// ---------------------------------------------------------------- transport
+cam_endpoint::cam_endpoint(const memory_config *config,
+                           unsigned sub_partition_id,
+                           const cam_functional *func, cam_log *log)
+    : m_config(config),
+      m_id(sub_partition_id),
+      m_external(config->cam_placement == 1),
+      m_engine(config, sub_partition_id, func, log),
+      m_free_out(0),
+      m_free_in(0),
+      n_out_pkts(0),
+      n_in_pkts(0),
+      n_out_bytes(0),
+      n_in_bytes(0),
+      n_peak_out_q(0),
+      n_peak_in_q(0),
+      n_refuse_cycles(0),
+      n_deliver_stall_cycles(0),
+      busy_out(0),
+      busy_in(0),
+      qwait_out(0),
+      qwait_in(0) {
+  assert(config->cam_placement <= 1);
+}
+
+bool cam_endpoint::full() const {
+  if (!m_external) return m_engine.full();
+  return m_out.size() >= m_config->cam_link_out_queue;
+}
+
+unsigned long long cam_endpoint::usable(double t) {
+  // first whole cycle >= t (tolerate float noise on integral values)
+  return (unsigned long long)ceil(t - 1e-9);
+}
+
+// Payload bytes a packet carries on the link (spec §10): query chunks their
+// data; commands and fill/write acks 8 B control; result packets their data.
+unsigned cam_endpoint::payload_bytes(mem_fetch *mf, bool outbound) const {
+  const warp_inst_t &inst = mf->get_inst();
+  if (outbound) return inst.m_cam_op == CAM_OP_QPUSH ? mf->get_data_size() : 8;
+  return inst.m_cam_op == CAM_OP_SEARCH ? mf->get_data_size() : 8;
+}
+
+double cam_endpoint::cross(bool outbound, unsigned payload, double t_ready) {
+  const unsigned unit = std::max(1u, m_config->cam_link_unit_bytes);
+  const unsigned bytes =
+      ((payload + m_config->cam_link_hdr_bytes + unit - 1) / unit) * unit;
+  const double ghz = m_config->cam_core_ghz;
+  // bytes / (GB/s) = ns; ns * GHz = core cycles
+  const double ser = m_config->cam_link_gbps > 0
+                         ? (double)bytes / m_config->cam_link_gbps * ghz
+                         : 0.0;
+  const double prop = m_config->cam_link_latency_ns * ghz;
+  double &free_at = outbound ? m_free_out : m_free_in;
+  const double start = std::max(t_ready, free_at);
+  free_at = start + ser;
+  if (outbound) {
+    n_out_pkts++;
+    n_out_bytes += bytes;
+    busy_out += ser;
+    qwait_out += start - t_ready;
+  } else {
+    n_in_pkts++;
+    n_in_bytes += bytes;
+    busy_in += ser;
+    qwait_in += start - t_ready;
+  }
+  return start + ser + prop;
+}
+
+void cam_endpoint::push(mem_fetch *mf, unsigned long long now) {
+  mf->m_cam.t_endpoint = now;
+  if (!m_external) {
+    m_engine.push(mf, now);
+    return;
+  }
+  const double arrive = cross(true, payload_bytes(mf, true), (double)now);
+  m_out.push_back(link_pkt{arrive, mf});
+  if (m_out.size() > n_peak_out_q) n_peak_out_q = m_out.size();
+}
+
+void cam_endpoint::cycle(unsigned long long now) {
+  if (m_external) {
+    if (full()) n_refuse_cycles++;
+    while (!m_out.empty() && usable(m_out.front().arrive) <= now) {
+      if (m_engine.full()) {  // credit: wait at the far side
+        n_deliver_stall_cycles++;
+        break;
+      }
+      m_engine.push(m_out.front().mf, now);
+      m_out.pop_front();
+    }
+  } else if (full()) {
+    n_refuse_cycles++;
+  }
+  m_engine.cycle(now);
+}
+
+mem_fetch *cam_endpoint::top(unsigned long long now) {
+  if (!m_external) {
+    mem_fetch *mf = m_engine.top(now);
+    if (mf) {
+      mf->m_cam.t_last_ready = m_engine.next_reply_time();
+      mf->m_cam.t_last_ep = m_engine.next_reply_time();
+    }
+    return mf;
+  }
+  // engine replies released by now enter the inbound link at release time
+  while (m_engine.has_reply() && m_engine.next_reply_time() <= now) {
+    const unsigned long long rel = m_engine.next_reply_time();
+    mem_fetch *mf = m_engine.top(now);
+    m_engine.pop();
+    const double arrive = cross(false, payload_bytes(mf, false), (double)rel);
+    mf->m_cam.t_last_ready = rel;
+    mf->m_cam.t_last_ep = usable(arrive);
+    m_in.push_back(link_pkt{arrive, mf});
+    if (m_in.size() > n_peak_in_q) n_peak_in_q = m_in.size();
+  }
+  if (!m_in.empty() && usable(m_in.front().arrive) <= now)
+    return m_in.front().mf;
+  return NULL;
+}
+
+void cam_endpoint::pop() {
+  if (m_external)
+    m_in.pop_front();
+  else
+    m_engine.pop();
+}
+
+bool cam_endpoint::saw_traffic() const {
+  return m_engine.n_searches || m_engine.n_fills || m_engine.n_writes ||
+         m_engine.n_qpush;
+}
+
+void cam_endpoint::print_stats(FILE *fp) const {
+  m_engine.print_stats(fp);
+  fprintf(fp,
+          "cam_endpoint[%u]: placement=%s refuse_cycles=%llu "
+          "deliver_stall_cycles=%llu",
+          m_id, m_external ? "external" : "on-chip", n_refuse_cycles,
+          n_deliver_stall_cycles);
+  if (m_external)
+    fprintf(fp,
+            " link_ns=%.3f link_gbps=%.3f unit=%u hdr=%u out_pkts=%llu "
+            "out_bytes=%llu out_busy_cyc=%.1f out_qwait_cyc=%.1f "
+            "peak_out_q=%llu in_pkts=%llu in_bytes=%llu in_busy_cyc=%.1f "
+            "in_qwait_cyc=%.1f peak_in_q=%llu",
+            m_config->cam_link_latency_ns, m_config->cam_link_gbps,
+            m_config->cam_link_unit_bytes, m_config->cam_link_hdr_bytes,
+            n_out_pkts, n_out_bytes, busy_out, qwait_out, n_peak_out_q,
+            n_in_pkts, n_in_bytes, busy_in, qwait_in, n_peak_in_q);
+  fprintf(fp, "\n");
 }

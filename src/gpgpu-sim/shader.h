@@ -308,6 +308,7 @@ class shd_warp_t {
   unsigned m_cam_wait_slot;
   unsigned m_cam_wait_count;
   unsigned long long m_cam_wait_issue;
+  unsigned long long m_cam_qstart = 0;  // first UCAMQ issue of the open query
   bool is_nanosleeping(uint64_t current_cycle) const {
     return m_nanosleep_until > 0 && current_cycle < m_nanosleep_until;
   }
@@ -2821,12 +2822,16 @@ class shader_core_ctx : public core_t {
   }
   void cam_issue(unsigned warp_id, warp_inst_t &inst);
   void cam_complete(class mem_fetch *mf);
+  void cam_packet(class mem_fetch *mf);
   void cam_log_wait(unsigned warp_id, unsigned kind, unsigned slot,
                     unsigned count, unsigned long long t_issue);
   unsigned cam_warp_outstanding(unsigned warp_id) const;
   const memory_config *cam_mem_config() const { return m_memory_config; }
-  std::vector<std::vector<unsigned long long>> m_cam_done, m_cam_free;
+  // per hardware CTA: completions, releases, submissions per slot (spec §6a)
+  std::vector<std::vector<unsigned long long>> m_cam_done, m_cam_free,
+      m_cam_sub;
   std::vector<unsigned> m_cam_first_warp;
+  std::map<unsigned long long, unsigned long long> m_cam_first_pkt;
   bool warp_waiting_at_mem_barrier(unsigned warp_id);
   void set_max_cta(const kernel_info_t &kernel);
   void warp_inst_complete(const warp_inst_t &inst);

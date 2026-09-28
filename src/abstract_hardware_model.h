@@ -1834,6 +1834,8 @@ class warp_inst_t : public inst_t {
   unsigned m_cam_seq;    // per-warp search sequence number (set at issue)
   unsigned
       m_cam_warp_in_cta;  // issuing warp's index within its CTA (set at issue)
+  unsigned long long m_cam_qready =
+      0;  // query preparation start (set at issue)
   bool is_cam() const { return m_cam_op != CAM_OP_NONE; }
   unsigned long long get_issue_cycle() const { return issue_cycle; }
   bool is_cam_mem() const {

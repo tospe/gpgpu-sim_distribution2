@@ -462,8 +462,8 @@ memory_sub_partition::memory_sub_partition(
   m_memcpy_cycle_offset = 0;
   m_chiplet_id = sub_partition_id / config->m_n_sub_partition_per_chiplet;
   if (config->cam_enabled)
-    m_cam = new cam_unit(config, sub_partition_id, gpu->get_cam_functional(),
-                         gpu->get_cam_log());
+    m_cam = new cam_endpoint(config, sub_partition_id,
+                             gpu->get_cam_functional(), gpu->get_cam_log());
   uint32_t local_sub_partition_id =
       sub_partition_id % config->m_n_sub_partition_per_chiplet;
   m_chiplet_icnt.init(m_chiplet_id, local_sub_partition_id, request_0_to_1,
@@ -715,9 +715,7 @@ mem_fetch *memory_sub_partition::cam_top(unsigned long long now) {
 }
 void memory_sub_partition::cam_pop() { m_cam->pop(); }
 void memory_sub_partition::cam_print_stats(FILE *fp) const {
-  if (m_cam && (m_cam->n_searches || m_cam->n_fills || m_cam->n_writes ||
-                m_cam->n_qpush))
-    m_cam->print_stats(fp);
+  if (m_cam && m_cam->saw_traffic()) m_cam->print_stats(fp);
 }
 
 bool memory_sub_partition::lrc_full() const {

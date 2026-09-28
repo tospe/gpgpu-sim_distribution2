@@ -551,10 +551,12 @@ void shader_core_ctx::init_warps(unsigned cta_id, unsigned start_thread,
   if (m_cam_done.size() < MAX_CTA_PER_SHADER) {
     m_cam_done.resize(MAX_CTA_PER_SHADER);
     m_cam_free.resize(MAX_CTA_PER_SHADER);
+    m_cam_sub.resize(MAX_CTA_PER_SHADER);
     m_cam_first_warp.resize(MAX_CTA_PER_SHADER, 0);
   }
   m_cam_done[cta_id].assign(m_memory_config->cam_slots, 0);
   m_cam_free[cta_id].assign(m_memory_config->cam_slots, 0);
+  m_cam_sub[cta_id].assign(m_memory_config->cam_slots, 0);
   m_cam_first_warp[cta_id] = start_thread / m_config->warp_size;
   if (m_config->model == POST_DOMINATOR) {
     unsigned start_warp = start_thread / m_config->warp_size;
@@ -3098,6 +3100,7 @@ void ldst_unit::writeback() {
           if (mf->m_cam.valid) {
             // CAM reply: result bytes land in the CTA result buffer; only the
             // last packet completes the request (no register writeback).
+            m_core->cam_packet(mf);
             if (mf->m_cam.frag + 1 == mf->m_cam.nfrag) m_core->cam_complete(mf);
             m_next_global.pop_front();
             delete mf;
@@ -5057,9 +5060,30 @@ void shader_core_ctx::cam_issue(unsigned warp_id, warp_inst_t &inst) {
             inst.m_cam_slot, m_memory_config->cam_slots);
     abort();
   }
+  // Slot ownership rule (spec §6a): at submission, no request of this slot is
+  // in flight and every previous use has been released.
+  if (inst.m_cam_op == CAM_OP_SEARCH || inst.m_cam_op == CAM_OP_FILL ||
+      inst.m_cam_op == CAM_OP_WRITE) {
+    const unsigned s = inst.m_cam_slot;
+    const unsigned long long sub = m_cam_sub[cta][s], done = m_cam_done[cta][s],
+                             freed = m_cam_free[cta][s];
+    if (m_memory_config->cam_strict_slots && (sub != done || freed < sub)) {
+      fprintf(stderr,
+              "GPGPU-Sim CAM: slot ownership violation: core %u warp %u slot "
+              "%u submitted %llu done %llu released %llu at cycle %llu\n",
+              m_sid, warp_id, s, sub, done, freed, now);
+      abort();
+    }
+    m_cam_sub[cta][s]++;
+  }
   switch (inst.m_cam_op) {
+    case CAM_OP_QPUSH:
+      if (!w->m_cam_qstart) w->m_cam_qstart = now;  // query preparation starts
+      break;
     case CAM_OP_SEARCH:
       inst.m_cam_seq = w->m_cam_seq++;
+      inst.m_cam_qready = w->m_cam_qstart ? w->m_cam_qstart : now;
+      w->m_cam_qstart = 0;
       w->m_cam_outstanding++;
       break;
     case CAM_OP_FILL:
@@ -5073,12 +5097,24 @@ void shader_core_ctx::cam_issue(unsigned warp_id, warp_inst_t &inst) {
       w->m_cam_wait_count = inst.m_cam_count;
       w->m_cam_wait_issue = now;
       break;
-    case CAM_OP_REL:
+    case CAM_OP_REL: {
       m_cam_free[cta][inst.m_cam_slot]++;
+      cam_log *log = m_gpu->get_cam_log();
+      if (log && log->on())
+        fprintf(log->fp(), "R,%u,%u,%u,%llu\n", m_sid, warp_id, inst.m_cam_slot,
+                now);
       break;
+    }
     default:
       break;
   }
+}
+
+// Every CAM reply packet at LDST writeback (records the first packet's time).
+void shader_core_ctx::cam_packet(mem_fetch *mf) {
+  if (mf->m_cam.frag == 0)
+    m_cam_first_pkt[mf->m_cam.req_id] =
+        m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
 }
 
 unsigned shader_core_ctx::cam_warp_outstanding(unsigned warp_id) const {
@@ -5110,6 +5146,19 @@ void shader_core_ctx::cam_complete(mem_fetch *mf) {
     for (auto &r : res) fprintf(log->fp(), ",%d", r.first);
     for (auto &r : res) fprintf(log->fp(), ",%.9g", r.second);
     fprintf(log->fp(), "\n");
+    // per-request placement-path timeline (spec §10)
+    unsigned long long first_sm = now;
+    auto it = m_cam_first_pkt.find(mf->m_cam.req_id);
+    if (it != m_cam_first_pkt.end()) {
+      first_sm = it->second;
+      m_cam_first_pkt.erase(it);
+    }
+    fprintf(log->fp(),
+            "X,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+            mf->m_cam.req_id, inst.m_cam_qready,
+            (unsigned long long)inst.get_issue_cycle(), mf->m_cam.t_endpoint,
+            mf->m_cam.t_arrive, mf->m_cam.t_admit, mf->m_cam.t_first,
+            mf->m_cam.t_last_ready, mf->m_cam.t_last_ep, first_sm, now);
   } else {
     fprintf(log->fp(), "F,%u,%u,%u,%u,%u,%llu,%llu,%llu\n", m_sid, wid,
             inst.m_cam_slot, inst.m_cam_row,

@@ -358,6 +358,33 @@ void memory_config::reg_options(class OptionParser *opp) {
                          "CAM functional data file (keys, queries)", "");
   option_parser_register(opp, "-gpgpu_cam_result_log", OPT_CSTR,
                          &cam_result_log, "CAM per-request result log", "");
+  // CAM v2 (spec §6a, §10); all hypothetical
+  option_parser_register(opp, "-gpgpu_cam_readout_per_cycle", OPT_UINT32,
+                         &cam_readout_per_cycle,
+                         "CAM results selected per readout step", "1");
+  option_parser_register(opp, "-gpgpu_cam_strict_slots", OPT_BOOL,
+                         &cam_strict_slots,
+                         "CAM: abort on slot ownership violations", "1");
+  option_parser_register(
+      opp, "-gpgpu_cam_placement", OPT_UINT32, &cam_placement,
+      "CAM placement: 0 on-chip (L2 side), 1 external link", "0");
+  option_parser_register(
+      opp, "-gpgpu_cam_link_latency_ns", OPT_DOUBLE, &cam_link_latency_ns,
+      "CAM external link one-way delay per direction (ns)", "0");
+  option_parser_register(opp, "-gpgpu_cam_link_gbps", OPT_DOUBLE,
+                         &cam_link_gbps,
+                         "CAM external link bandwidth per direction (GB/s; 0 = "
+                         "no serialization)",
+                         "0");
+  option_parser_register(opp, "-gpgpu_cam_link_unit_bytes", OPT_UINT32,
+                         &cam_link_unit_bytes,
+                         "CAM external link transport unit (bytes)", "32");
+  option_parser_register(opp, "-gpgpu_cam_link_hdr_bytes", OPT_UINT32,
+                         &cam_link_hdr_bytes,
+                         "CAM external link header bytes per packet", "0");
+  option_parser_register(
+      opp, "-gpgpu_cam_link_out_queue", OPT_UINT32, &cam_link_out_queue,
+      "CAM external outbound queue capacity (packets)", "64");
   option_parser_register(opp, "-dram_latency", OPT_UINT32, &dram_latency,
                          "DRAM latency (default 30)", "30");
   option_parser_register(opp, "-dram_dual_bus_interface", OPT_UINT32,
@@ -1170,6 +1197,9 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
           gpu_tot_sim_cycle));
     }
     if (m_memory_config->cam_enabled) {  // before the units that use them
+      // core clock for ns -> cycle conversion of external link delays
+      const_cast<memory_config *>(m_memory_config)->cam_core_ghz =
+          m_config.core_freq / 1e9;
       m_cam_func = new cam_functional(m_memory_config->cam_func_file);
       m_cam_log = new cam_log(m_memory_config->cam_result_log);
     }

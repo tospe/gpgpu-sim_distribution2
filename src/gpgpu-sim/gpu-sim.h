@@ -385,6 +385,16 @@ class memory_config {
   unsigned cam_input_queue;  // unit input queue entries
   char *cam_func_file;       // functional data (keys, queries)
   char *cam_result_log;      // per-request result/event log
+  // v2 (spec §6a, §10)
+  unsigned cam_readout_per_cycle;  // results selected per readout step (R)
+  bool cam_strict_slots;           // enforce slot ownership rule
+  unsigned cam_placement;          // 0 on-chip, 1 external link
+  double cam_link_latency_ns;      // one-way, per direction
+  double cam_link_gbps;            // per direction; 0 = no serialization
+  unsigned cam_link_unit_bytes;
+  unsigned cam_link_hdr_bytes;
+  unsigned cam_link_out_queue;  // outbound packets accepted, not delivered
+  double cam_core_ghz;          // core clock for ns -> cycles (set at init)
 
   // DRAM parameters
 

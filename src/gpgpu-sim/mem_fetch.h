@@ -97,6 +97,9 @@ class mem_fetch {
     unsigned frag = 0, nfrag = 1;   // result packet index / count
     unsigned long long req_id = 0;  // unit-assigned search id (result log)
     unsigned long long t_arrive = 0, t_admit = 0, t_first = 0;
+    // placement path (spec §10): command at the GPU-side endpoint; this
+    // packet's release by the engine and its arrival back at the endpoint
+    unsigned long long t_endpoint = 0, t_last_ready = 0, t_last_ep = 0;
   } m_cam;
   std::shared_ptr<warp_inst_t> get_inst_ptr() const { return m_inst; }
 
