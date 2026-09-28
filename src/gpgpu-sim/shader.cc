@@ -5137,6 +5137,9 @@ void shader_core_ctx::cam_issue(unsigned warp_id, warp_inst_t &inst) {
     }
     case CAM_OP_SEARCH:
       inst.m_cam_seq = w->m_cam_seq++;
+      if (m_memory_config->cam_func_seq_across_launches)
+        inst.m_cam_seq = m_gpu->m_cam_func_seq[std::make_pair(
+            inst.get_cuda_cta_id().x, inst.m_cam_warp_in_cta)]++;
       inst.m_cam_qready = w->m_cam_qstart ? w->m_cam_qstart : now;
       w->m_cam_qstart = 0;
       if (!pull) w->m_cam_outstanding++;

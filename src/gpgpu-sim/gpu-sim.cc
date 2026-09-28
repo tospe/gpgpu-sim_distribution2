@@ -366,6 +366,13 @@ void memory_config::reg_options(class OptionParser *opp) {
                          &cam_strict_slots,
                          "CAM: abort on slot ownership violations", "1");
   option_parser_register(
+      opp, "-gpgpu_cam_func_seq_across_launches", OPT_BOOL,
+      &cam_func_seq_across_launches,
+      "CAM functional query identity: 0 = search sequence number per warp "
+      "launch (legacy); 1 = per (CTA index, warp in CTA), continued across "
+      "kernel launches (multi-kernel workloads). No timing effect",
+      "0");
+  option_parser_register(
       opp, "-gpgpu_cam_placement", OPT_UINT32, &cam_placement,
       "CAM placement: 0 on-chip (L2 side), 1 external link", "0");
   option_parser_register(

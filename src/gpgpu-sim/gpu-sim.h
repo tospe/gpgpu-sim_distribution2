@@ -37,6 +37,7 @@
 #include <fstream>
 #include <iostream>
 #include <list>
+#include <map>
 #include "../abstract_hardware_model.h"
 #include "../option_parser.h"
 #include "../trace.h"
@@ -391,6 +392,7 @@ class memory_config {
   // v2 (spec §6a, §10)
   unsigned cam_readout_per_cycle;  // results selected per readout step (R)
   bool cam_strict_slots;           // enforce slot ownership rule
+  bool cam_func_seq_across_launches;  // functional query identity (see option)
   unsigned cam_placement;          // 0 on-chip, 1 external link
   double cam_link_latency_ns;      // one-way, per direction
   double cam_link_gbps;            // per direction; 0 = no serialization
@@ -668,6 +670,10 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long m_last_cam_progress = 0;
   cam_functional *m_cam_func = NULL;
   cam_log *m_cam_log = NULL;
+  // -gpgpu_cam_func_seq_across_launches: next search sequence number per
+  // (CTA index x, warp in CTA), kept across kernel launches (functional
+  // query identity only; no timing effect)
+  std::map<std::pair<unsigned, unsigned>, unsigned> m_cam_func_seq;
 
   void set_prop(struct cudaDeviceProp *prop);
 
