@@ -203,7 +203,8 @@ class cam_endpoint {
   // the input queue is NOT counted, so real deadlocks stay detectable.
   bool busy() const {
     return m_engine.scheduled_work() || !m_out.empty() || !m_in.empty() ||
-           !m_fwd.empty() || !m_events.empty() || !m_ret.empty();
+           !m_fwd.empty() || !m_cls.empty() || !m_events.empty() ||
+           !m_ret.empty();
   }
   unsigned long long progress() const {
     return m_engine.progress() + n_pull_progress;
@@ -213,7 +214,7 @@ class cam_endpoint {
   // memory partition's channel accepts its requests (pull_ready/pull_accept).
   bool pull() const { return m_pull; }
   bool pull_ready(unsigned long long now) const {
-    return m_pull && !m_fwd.empty() && m_fwd.front().t <= now;
+    return m_pull && !m_cls.empty();
   }
   // accept the head request on the channel at `now`; returns the channel
   // occupancy in 32 B atoms (DRAM cycles)
@@ -243,7 +244,9 @@ class cam_endpoint {
     mem_fetch *mf;
     unsigned long long t_accept;
   };
-  std::deque<timed_mf> m_fwd;     // waiting for the L2 pass-through + channel
+  std::deque<timed_mf> m_fwd;     // in the L2 pass-through pipeline (ROP delay)
+  std::deque<timed_mf> m_cls;     // CAM request-class queue (bounded), waiting
+                                  // for the channel
   std::deque<timed_mf> m_events;  // accepted, reaching the device at t
   std::deque<timed_mf> m_ret;     // read data back at the sub-partition at t
   std::map<std::pair<unsigned, unsigned>, unsigned long long> m_status;
@@ -255,7 +258,8 @@ class cam_endpoint {
                      n_pull_qwrite = 0, n_pull_cmd = 0, n_pull_poll = 0,
                      n_pull_load = 0, n_pull_other = 0, n_pull_ret = 0,
                      n_pull_dev_stall = 0, n_pull_peak_fwd = 0,
-                     n_pull_status_updates = 0, n_pull_refuse = 0;
+                     n_pull_status_updates = 0, n_pull_refuse = 0,
+                     n_pull_peak_pipe = 0;
 
  private:
   cam_unit m_engine;

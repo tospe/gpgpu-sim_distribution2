@@ -496,7 +496,9 @@ cam_endpoint::cam_endpoint(const memory_config *config,
 // is accepted only if its wire bytes fit in the remaining window. A packet
 // occupies the window from acceptance until delivery into the engine input.
 bool cam_endpoint::full() const {
-  if (m_pull) return m_fwd.size() >= m_config->cam_pull_queue;
+  // B-pull: like the L2 input (full when the queue after the ROP pipeline is
+  // full), the slice refuses while the CAM request-class queue is full
+  if (m_pull) return m_cls.size() >= m_config->cam_pull_queue;
   if (!m_external) return m_engine.full();
   if (m_config->cam_link_window_bytes)
     return m_out_inflight_bytes + wire_bytes(32) >
@@ -560,7 +562,7 @@ void cam_endpoint::push(mem_fetch *mf, unsigned long long now) {
   mf->m_cam.t_endpoint = now;
   if (m_pull) {  // uncached pass-through: the L2 pipeline (ROP) latency
     m_fwd.push_back(timed_mf{now + m_config->rop_latency, mf, 0});
-    if (m_fwd.size() > n_pull_peak_fwd) n_pull_peak_fwd = m_fwd.size();
+    if (m_fwd.size() > n_pull_peak_pipe) n_pull_peak_pipe = m_fwd.size();
     n_pull_progress++;
     return;
   }
@@ -679,11 +681,12 @@ void cam_endpoint::print_stats(FILE *fp) const {
     fprintf(fp,
             "cam_pull[%u]: accepted=%llu atoms=%llu qwrite=%llu cmd=%llu "
             "poll=%llu load=%llu other=%llu returns=%llu dev_stall=%llu "
-            "peak_fwd=%llu status_updates=%llu refuse_cycles=%llu\n",
+            "peak_fwd=%llu peak_pipe=%llu status_updates=%llu "
+            "refuse_cycles=%llu\n",
             m_id, n_pull_acc, n_pull_atoms, n_pull_qwrite, n_pull_cmd,
             n_pull_poll, n_pull_load, n_pull_other, n_pull_ret,
-            n_pull_dev_stall, n_pull_peak_fwd, n_pull_status_updates,
-            n_pull_refuse);
+            n_pull_dev_stall, n_pull_peak_fwd, n_pull_peak_pipe,
+            n_pull_status_updates, n_pull_refuse);
     return;
   }
   fprintf(fp,
@@ -723,8 +726,8 @@ void cam_endpoint::print_stats(FILE *fp) const {
 // DRAM model's fixed latency; device access time assumed equal, [A]).
 unsigned cam_endpoint::pull_accept(unsigned long long now) {
   assert(pull_ready(now));
-  mem_fetch *mf = m_fwd.front().mf;
-  m_fwd.pop_front();
+  mem_fetch *mf = m_cls.front().mf;
+  m_cls.pop_front();
   const unsigned bytes = std::max(1u, mf->get_data_size());
   const unsigned atoms = (bytes + 31) / 32;
   n_pull_acc++;
@@ -745,6 +748,13 @@ unsigned cam_endpoint::pull_accept(unsigned long long now) {
 }
 
 void cam_endpoint::pull_cycle(unsigned long long now) {
+  // pass-through pipeline -> CAM request-class queue (bounded)
+  while (!m_fwd.empty() && m_fwd.front().t <= now &&
+         m_cls.size() < m_config->cam_pull_queue) {
+    m_cls.push_back(m_fwd.front());
+    m_fwd.pop_front();
+    if (m_cls.size() > n_pull_peak_fwd) n_pull_peak_fwd = m_cls.size();
+  }
   // requests reaching the device, in acceptance order
   while (!m_events.empty() && m_events.front().t <= now) {
     timed_mf e = m_events.front();
