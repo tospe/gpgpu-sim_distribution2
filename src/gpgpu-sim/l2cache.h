@@ -347,6 +347,7 @@ class memory_sub_partition {
   mem_fetch *cam_top(unsigned long long now);
   void cam_pop();
   bool cam_busy() const;
+  unsigned long long cam_progress() const;
   // F1: reply-port arbitration state/statistics (CAM vs ordinary L2 replies)
   bool cam_rr_prefers_cam() const { return m_rr_cam_next; }
   void cam_note_grant(bool to_cam, bool both_ready) {

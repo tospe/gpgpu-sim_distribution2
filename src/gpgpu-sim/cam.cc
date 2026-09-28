@@ -173,7 +173,16 @@ cam_unit::cam_unit(const memory_config *config, unsigned sub_partition_id,
       n_readout_wait_cycles(0),
       n_result_pkts(0),
       n_input_full_cycles(0),
-      n_peak_in_service(0) {}
+      n_peak_in_service(0) {
+  m_out_cap = config->cam_output_buffer_bytes;
+  if (m_out_cap < config->cam_result_pkt_bytes) {
+    fprintf(stderr,
+            "GPGPU-Sim CAM: -gpgpu_cam_output_buffer_bytes %u < one result "
+            "packet (%u B)\n",
+            m_out_cap, config->cam_result_pkt_bytes);
+    abort();
+  }
+}
 
 void cam_unit::push(mem_fetch *mf, unsigned long long now) {
   assert(!full());
@@ -187,7 +196,7 @@ void cam_unit::emit(mem_fetch *mf, unsigned long long ready) {
 
 bool cam_unit::busy() const {
   return !m_input.empty() || m_mutation || !m_return.empty() ||
-         !m_in_service.empty();
+         !m_readout.empty();
 }
 
 void cam_unit::start_search(mem_fetch *mf, unsigned long long now) {
@@ -207,53 +216,112 @@ void cam_unit::start_search(mem_fetch *mf, unsigned long long now) {
     m_log->stash(req_id, res);
   }
 
-  // Readout: first result selected at max(now + L, port free); result i at
-  // t0 + floor(i / R) * topk (R results per readout step, spec §10); a packet
-  // leaves when its last result is selected. R = 1 is the v1 behaviour.
+  // Readout is event-driven (F2): see readout_advance().
+  readout_t r;
+  r.cmd = mf;
+  r.req_id = req_id;
+  r.k = k;
+  r.admit = now;
+  r.earliest = now + m_config->cam_search_latency;
+  m_readout.push_back(r);
+  m_n_in_service++;
+  if (m_n_in_service > n_peak_in_service) n_peak_in_service = m_n_in_service;
+}
+
+// Readout port (spec §10 + F2): searches are read out in admission order. A
+// step selects up to R results at time t = max(earliest, port free) for the
+// first step, then every topk cycles. Selected results occupy the output
+// buffer (entry bytes each, including a partially assembled packet) until
+// their packet leaves the unit (pop). A step selects only as many results as
+// fit; with no room for one result, readout stalls and resumes at the first
+// call with room (never earlier than that call). A packet is formed when its
+// last result is selected; a search leaves service when its last result is
+// selected.
+void cam_unit::readout_advance(unsigned long long now) {
   const unsigned entry = m_config->cam_result_entry_bytes;
   const unsigned per_pkt = std::max(1u, m_config->cam_result_pkt_bytes / entry);
-  const unsigned npkt = (k + per_pkt - 1) / per_pkt;
-  const unsigned long long want = now + m_config->cam_search_latency;
-  const unsigned long long t0 = std::max(want, m_readout_free);
-  n_readout_wait_cycles += t0 - want;
   const unsigned topk = m_config->cam_topk_latency;
   const unsigned R = std::max(1u, m_config->cam_readout_per_cycle);
-  auto sel = [&](unsigned i) {
-    return t0 + (unsigned long long)(i / R) * topk;
-  };
-  m_readout_free = t0 + (unsigned long long)((k + R - 1) / R) * topk;
-  const unsigned long long t_last = sel(k - 1);
-  m_in_service.insert(t_last);
-  if (m_in_service.size() > n_peak_in_service)
-    n_peak_in_service = m_in_service.size();
-
-  for (unsigned j = 0; j < npkt; ++j) {
-    const unsigned last_idx = std::min((j + 1) * per_pkt, k) - 1;
-    const unsigned n_in_pkt = last_idx + 1 - j * per_pkt;
-    mem_fetch *f =
-        new mem_fetch(mf->get_mem_access(), mf->get_inst_ptr(),
-                      mf->get_streamID(), mf->get_ctrl_size(), mf->get_wid(),
-                      mf->get_sid(), mf->get_tpc(), m_config, now);
-    f->set_data_size(n_in_pkt * entry);
-    f->m_cam.valid = true;
-    f->m_cam.frag = j;
-    f->m_cam.nfrag = npkt;
-    f->m_cam.req_id = req_id;
-    f->m_cam.t_endpoint = mf->m_cam.t_endpoint;
-    f->m_cam.t_arrive = mf->m_cam.t_arrive;
-    f->m_cam.t_admit = now;
-    f->m_cam.t_first = t0;
-    f->set_reply();
-    emit(f, sel(last_idx));
-    n_result_pkts++;
+  while (!m_readout.empty()) {
+    readout_t &h = m_readout.front();
+    unsigned long long t;
+    if (!h.started) {
+      t = std::max(h.earliest, m_readout_free);
+    } else {
+      t = h.t_next;
+    }
+    if (m_stalled) t = std::max(t, now);  // resume no earlier than this call
+    if (t > now) break;
+    // up to R results per step, limited by the free output-buffer space
+    const unsigned room = (unsigned)((m_out_cap - m_out_bytes) / entry);
+    const unsigned want = std::min(R, h.k - h.next);
+    const unsigned n = std::min(want, room);
+    if (n > 0 && n < want) n_readout_limited_steps++;  // step cut by space
+    if (n == 0) {
+      if (!m_stalled) {
+        m_stalled = true;
+        m_stall_since = t;
+        n_readout_stalls++;
+      }
+      break;
+    }
+    if (m_stalled) {
+      n_readout_stall_cycles += t - m_stall_since;
+      m_stalled = false;
+    }
+    if (!h.started) {
+      h.started = true;
+      h.t_first = t;
+      n_readout_wait_cycles += t - h.earliest;
+    }
+    m_progress++;
+    m_out_bytes += (unsigned long long)n * entry;
+    if (m_out_bytes > n_peak_out_bytes) n_peak_out_bytes = m_out_bytes;
+    m_readout_free = t + topk;
+    h.t_next = t + topk;
+    // the step's results fill packets in order; every packet completed in this
+    // step (its last result selected) is released at t
+    const unsigned npkt = (h.k + per_pkt - 1) / per_pkt;
+    for (unsigned left = n; left > 0;) {
+      const unsigned m = std::min(left, per_pkt - h.in_pkt);
+      left -= m;
+      h.in_pkt += m;
+      h.next += m;
+      if (h.in_pkt < per_pkt && h.next < h.k) break;  // partial packet
+      mem_fetch *mf = h.cmd;
+      mem_fetch *f =
+          new mem_fetch(mf->get_mem_access(), mf->get_inst_ptr(),
+                        mf->get_streamID(), mf->get_ctrl_size(), mf->get_wid(),
+                        mf->get_sid(), mf->get_tpc(), m_config, h.admit);
+      f->set_data_size(h.in_pkt * entry);
+      f->m_cam.valid = true;
+      f->m_cam.frag = h.frag++;
+      f->m_cam.nfrag = npkt;
+      f->m_cam.req_id = h.req_id;
+      f->m_cam.t_endpoint = mf->m_cam.t_endpoint;
+      f->m_cam.t_arrive = mf->m_cam.t_arrive;
+      f->m_cam.t_admit = h.admit;
+      f->m_cam.t_first = h.t_first;
+      f->m_cam.out_bytes = h.in_pkt * entry;
+      f->set_reply();
+      emit(f, t);
+      n_result_pkts++;
+      h.in_pkt = 0;
+    }
+    assert(h.next <= h.k);
+    if (h.next == h.k) {  // last result selected: leaves service
+      assert(m_n_in_service > 0);
+      m_n_in_service--;
+      delete h.cmd;
+      m_readout.pop_front();
+    }
   }
-  delete mf;
+  if (m_stalled) n_output_full_calls++;
 }
 
 void cam_unit::cycle(unsigned long long now) {
-  // searches whose last result has been selected leave service
-  while (!m_in_service.empty() && *m_in_service.begin() <= now)
-    m_in_service.erase(m_in_service.begin());
+  // readout up to now (searches whose last result is selected leave service)
+  readout_advance(now);
 
   // a fill/write completes: its rows become searchable, then it is acked
   if (m_mutation && now >= m_mutation_done) {
@@ -320,7 +388,7 @@ void cam_unit::cycle(unsigned long long now) {
     n_admit_wait_query++;
     return;
   }
-  if (m_in_service.size() >= m_config->cam_max_outstanding) {
+  if (m_n_in_service >= m_config->cam_max_outstanding) {
     n_admit_wait_outstanding++;
     return;
   }
@@ -338,7 +406,14 @@ mem_fetch *cam_unit::top(unsigned long long now) {
   return m_return.top().mf;
 }
 
-void cam_unit::pop() { m_return.pop(); }
+// A packet leaves the unit: its result bytes leave the output buffer.
+void cam_unit::pop() {
+  mem_fetch *mf = m_return.top().mf;
+  assert(m_out_bytes >= mf->m_cam.out_bytes);
+  m_out_bytes -= mf->m_cam.out_bytes;
+  m_progress++;
+  m_return.pop();
+}
 
 void cam_unit::print_stats(FILE *fp) const {
   fprintf(fp,
@@ -346,11 +421,15 @@ void cam_unit::print_stats(FILE *fp) const {
           "overflow=%llu qpush=%llu qpush_bytes=%llu result_pkts=%llu "
           "peak_in_service=%llu ii_wait=%llu admit_wait_query=%llu "
           "admit_wait_outstanding=%llu admit_wait_mutation=%llu "
-          "readout_wait=%llu input_full_cycles=%llu\n",
+          "readout_wait=%llu input_full_cycles=%llu out_buf_cap=%u "
+          "peak_out_buf_bytes=%llu readout_stalls=%llu "
+          "readout_stall_cycles=%llu readout_limited_steps=%llu\n",
           m_id, n_searches, n_fills, n_fill_rows, n_writes, n_overflow, n_qpush,
           n_qpush_bytes, n_result_pkts, n_peak_in_service, n_ii_wait_cycles,
           n_admit_wait_query, n_admit_wait_outstanding, n_admit_wait_mutation,
-          n_readout_wait_cycles, n_input_full_cycles);
+          n_readout_wait_cycles, n_input_full_cycles, m_out_cap,
+          n_peak_out_bytes, n_readout_stalls, n_readout_stall_cycles,
+          n_readout_limited_steps);
 }
 
 // ---------------------------------------------------------------- transport
@@ -376,6 +455,15 @@ cam_endpoint::cam_endpoint(const memory_config *config,
       qwait_out(0),
       qwait_in(0) {
   assert(config->cam_placement <= 1);
+  if (m_external &&
+      config->cam_link_rx_bytes < wire_bytes(config->cam_result_pkt_bytes)) {
+    fprintf(stderr,
+            "GPGPU-Sim CAM: -gpgpu_cam_link_rx_bytes %u < one result packet "
+            "on the wire (%u B)\n",
+            config->cam_link_rx_bytes,
+            wire_bytes(config->cam_result_pkt_bytes));
+    abort();
+  }
 }
 
 // Outbound window (spec §10). Packet mode: at most cam_link_out_queue packets.
@@ -480,6 +568,8 @@ void cam_endpoint::cycle(unsigned long long now) {
 }
 
 mem_fetch *cam_endpoint::top(unsigned long long now) {
+  // results due by now form packets before this cycle's reply injection
+  m_engine.readout_advance(now);
   if (!m_external) {
     mem_fetch *mf = m_engine.top(now);
     if (mf) {
@@ -488,28 +578,49 @@ mem_fetch *cam_endpoint::top(unsigned long long now) {
     }
     return mf;
   }
-  // engine replies released by now enter the inbound link at release time
+  // Engine replies released by now enter the inbound link when it is free (a
+  // waiting packet stays in the engine's accounted output buffer, F2) and when
+  // its wire bytes fit in the receive allowance (on the link or waiting at the
+  // GPU endpoint; released at NoC injection). Start = max(release, link free),
+  // or this call's cycle if it had been blocked by the receive allowance.
   while (m_engine.has_reply() && m_engine.next_reply_time() <= now) {
+    if (m_free_in > (double)now + 1e-9) break;  // link busy
     const unsigned long long rel = m_engine.next_reply_time();
     mem_fetch *mf = m_engine.top(now);
-    m_engine.pop();
+    const unsigned payload = payload_bytes(mf, false);
+    const unsigned wire = wire_bytes(payload);
+    if (m_rx_bytes + wire > m_config->cam_link_rx_bytes) {
+      if (!m_rx_blocked) {
+        m_rx_blocked = true;
+        n_rx_blocks++;
+      }
+      break;
+    }
+    const double t_ready = m_rx_blocked ? (double)now : (double)rel;
+    m_rx_blocked = false;
+    m_engine.pop();  // leaves the output buffer
     const double arrive =
-        cross(false, payload_bytes(mf, false), (double)rel, NULL);
+        cross(false, payload, std::max(t_ready, (double)rel), NULL);
     mf->m_cam.t_last_ready = rel;
     mf->m_cam.t_last_ep = usable(arrive);
-    m_in.push_back(link_pkt{arrive, mf});
+    m_in.push_back(link_pkt{arrive, mf, wire, now});
+    m_rx_bytes += wire;
+    if (m_rx_bytes > n_peak_rx_bytes) n_peak_rx_bytes = m_rx_bytes;
     if (m_in.size() > n_peak_in_q) n_peak_in_q = m_in.size();
   }
+
   if (!m_in.empty() && usable(m_in.front().arrive) <= now)
     return m_in.front().mf;
   return NULL;
 }
 
 void cam_endpoint::pop() {
-  if (m_external)
+  if (m_external) {
+    m_rx_bytes -= m_in.front().wire;  // injected into the GPU network
     m_in.pop_front();
-  else
+  } else {
     m_engine.pop();
+  }
 }
 
 bool cam_endpoint::saw_traffic() const {
@@ -537,9 +648,11 @@ void cam_endpoint::print_stats(FILE *fp) const {
   if (m_external)
     fprintf(
         fp,
+        " rx_bytes_cap=%u peak_rx_bytes=%llu rx_blocks=%llu"
         " window_bytes=%u out_payload=%llu out_hdr=%llu out_wire=%llu "
         "in_payload=%llu in_hdr=%llu in_wire=%llu peak_out_inflight_bytes=%llu "
         "mean_out_occupancy_cyc=%.2f",
+        m_config->cam_link_rx_bytes, n_peak_rx_bytes, n_rx_blocks,
         m_config->cam_link_window_bytes, n_out_payload, n_out_hdr, n_out_bytes,
         n_in_payload, n_in_hdr, n_in_bytes, n_peak_out_inflight_bytes,
         n_out_delivered ? (double)occ_cycles_out / n_out_delivered : 0.0);

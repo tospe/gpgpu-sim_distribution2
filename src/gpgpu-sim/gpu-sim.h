@@ -398,6 +398,9 @@ class memory_config {
   unsigned
       cam_link_window_bytes;  // outbound window in wire bytes (0 = packet mode)
   char *cam_addr_probe;       // diagnostic: file of addresses to decode
+  unsigned cam_output_buffer_bytes;  // CAM output buffer (result bytes), F2
+  unsigned cam_link_rx_bytes;  // external: inbound in-flight + endpoint receive
+                               // bytes
 
   // DRAM parameters
 
@@ -642,7 +645,8 @@ class gpgpu_sim : public gpgpu_t {
   // CAM extension: functional contents and per-request log (may be null)
   cam_functional *get_cam_functional() const { return m_cam_func; }
   cam_log *get_cam_log() const { return m_cam_log; }
-  bool cam_busy() const;
+  bool cam_busy();
+  unsigned long long m_last_cam_progress = 0;
   cam_functional *m_cam_func = NULL;
   cam_log *m_cam_log = NULL;
 

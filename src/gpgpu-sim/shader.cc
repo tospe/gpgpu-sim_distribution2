@@ -5112,6 +5112,11 @@ void shader_core_ctx::cam_issue(unsigned warp_id, warp_inst_t &inst) {
 
 // Every CAM reply packet at LDST writeback (records the first packet's time).
 void shader_core_ctx::cam_packet(mem_fetch *mf) {
+  if (mf->get_inst().m_cam_op == CAM_OP_SEARCH) {
+    const bool fresh =
+        m_cam_pkts_seen[mf->m_cam.req_id].insert(mf->m_cam.frag).second;
+    assert(fresh && mf->m_cam.frag < mf->m_cam.nfrag);  // no duplicate packet
+  }
   if (mf->m_cam.frag == 0)
     m_cam_first_pkt[mf->m_cam.req_id] =
         m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
@@ -5132,6 +5137,13 @@ void shader_core_ctx::cam_complete(mem_fetch *mf) {
       m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
   assert(w->m_cam_outstanding > 0);
   w->m_cam_outstanding--;
+  if (inst.m_cam_op == CAM_OP_SEARCH) {
+    // every result packet of this search arrived before completion (no loss)
+    auto seen = m_cam_pkts_seen.find(mf->m_cam.req_id);
+    assert(seen != m_cam_pkts_seen.end() &&
+           seen->second.size() == mf->m_cam.nfrag);
+    m_cam_pkts_seen.erase(seen);
+  }
   m_cam_done[cta][inst.m_cam_slot]++;
   cam_log *log = m_gpu->get_cam_log();
   if (!log || !log->on()) return;

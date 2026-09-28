@@ -391,6 +391,20 @@ void memory_config::reg_options(class OptionParser *opp) {
                          "from endpoint acceptance to engine delivery (0 = use "
                          "-gpgpu_cam_link_out_queue packets)",
                          "0");
+  option_parser_register(opp, "-gpgpu_cam_output_buffer_bytes", OPT_UINT32,
+                         &cam_output_buffer_bytes,
+                         "CAM output buffer capacity in result bytes (selected "
+                         "results, incl. a partial packet, until their packet "
+                         "leaves the unit); readout stalls when full "
+                         "(hypothetical)",
+                         "32768");
+  option_parser_register(opp, "-gpgpu_cam_link_rx_bytes", OPT_UINT32,
+                         &cam_link_rx_bytes,
+                         "CAM external: bytes of result packets on the inbound "
+                         "link or waiting at the GPU endpoint (released at NoC "
+                         "injection); a packet starts only if it fits "
+                         "(hypothetical)",
+                         "32768");
   option_parser_register(opp, "-gpgpu_cam_addr_probe", OPT_CSTR,
                          &cam_addr_probe,
                          "CAM diagnostic: print the sub-partition of each hex "
@@ -1637,14 +1651,23 @@ void gpgpu_sim::print_stats(unsigned long long streamID) {
   }
 }
 
-// CAM extension: CAM requests in flight are progress (a warp may legitimately
-// wait at CAMWAIT for longer than the deadlock sampling interval, e.g. a
-// large fill), so they suppress the no-instructions-committed deadlock check.
-bool gpgpu_sim::cam_busy() const {
+// CAM extension: CAM work that completes on its own (a fill, unstalled
+// readout, packets on the link) is progress (a warp may legitimately wait at
+// CAMWAIT for longer than the deadlock sampling interval, e.g. a large fill),
+// and so are readout steps / packets leaving a CAM unit since the last check.
+// Either suppresses the no-instructions-committed deadlock check; a CAM
+// output stalled on a blocked reply port with no progress does not.
+bool gpgpu_sim::cam_busy() {
   if (!m_memory_config->cam_enabled) return false;
-  for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++)
-    if (m_memory_sub_partition[i]->cam_busy()) return true;
-  return false;
+  unsigned long long prog = 0;
+  bool busy = false;
+  for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+    busy |= m_memory_sub_partition[i]->cam_busy();
+    prog += m_memory_sub_partition[i]->cam_progress();
+  }
+  if (prog != m_last_cam_progress) busy = true;
+  m_last_cam_progress = prog;
+  return busy;
 }
 
 void gpgpu_sim::deadlock_check() {

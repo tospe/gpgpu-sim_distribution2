@@ -715,6 +715,9 @@ mem_fetch *memory_sub_partition::cam_top(unsigned long long now) {
 }
 void memory_sub_partition::cam_pop() { m_cam->pop(); }
 bool memory_sub_partition::cam_busy() const { return m_cam && m_cam->busy(); }
+unsigned long long memory_sub_partition::cam_progress() const {
+  return m_cam ? m_cam->progress() : 0;
+}
 void memory_sub_partition::cam_print_stats(FILE *fp) const {
   if (m_cam && m_cam->saw_traffic()) {
     m_cam->print_stats(fp);

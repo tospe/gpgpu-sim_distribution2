@@ -82,14 +82,21 @@ class cam_unit {
   void push(mem_fetch *mf, unsigned long long now);
   void cycle(unsigned long long now);
   mem_fetch *top(unsigned long long now);  // next reply ready by now, or NULL
+  // select results due by now (called before replies are taken each cycle)
+  void readout_advance(unsigned long long now);
   void pop();
   bool busy() const;
   void print_stats(FILE *fp) const;
   // release time of the next reply (only valid if has_reply())
   bool has_reply() const { return !m_return.empty(); }
+  // time-driven work: a fill/write in progress or readout that is not stalled
+  // on the output buffer. Packets waiting for the reply port are not counted
+  // (their progress shows as pops, see progress()).
   bool scheduled_work() const {
-    return m_mutation || !m_in_service.empty() || !m_return.empty();
+    return m_mutation || (!m_readout.empty() && !m_stalled);
   }
+  // count of readout steps and packets leaving the unit (deadlock detection)
+  unsigned long long progress() const { return m_progress; }
   unsigned long long next_reply_time() const { return m_return.top().ready; }
 
  private:
@@ -103,6 +110,19 @@ class cam_unit {
   };
   void emit(mem_fetch *mf, unsigned long long ready);
   void start_search(mem_fetch *mf, unsigned long long now);
+  struct readout_t {
+    mem_fetch *cmd = NULL;  // the search command (kept for packet formation)
+    unsigned long long req_id = 0, admit = 0, earliest = 0, t_first = 0,
+                       t_next = 0;
+    unsigned k = 1, next = 0, in_pkt = 0, frag = 0;
+    bool started = false;
+  };
+  std::deque<readout_t> m_readout;
+  unsigned m_n_in_service = 0;
+  unsigned long long m_out_bytes = 0, m_out_cap = 0;  // output buffer (F2)
+  bool m_stalled = false;
+  unsigned long long m_progress = 0;
+  unsigned long long m_stall_since = 0;
 
   const memory_config *m_config;
   unsigned m_id;
@@ -115,8 +135,6 @@ class cam_unit {
   // fill/write in progress
   mem_fetch *m_mutation;
   unsigned long long m_mutation_done;
-  // searches in service: completion (last packet) times
-  std::multiset<unsigned long long> m_in_service;
   unsigned long long m_last_start;
   bool m_started_once;
   unsigned long long m_readout_free;
@@ -131,6 +149,9 @@ class cam_unit {
       n_fill_rows, n_overflow, n_ii_wait_cycles, n_admit_wait_query,
       n_admit_wait_outstanding, n_admit_wait_mutation, n_readout_wait_cycles,
       n_result_pkts, n_input_full_cycles, n_peak_in_service;
+  unsigned long long n_peak_out_bytes = 0, n_readout_stalls = 0,
+                     n_readout_stall_cycles = 0, n_output_full_calls = 0,
+                     n_readout_limited_steps = 0;
 };
 
 // Placement transport around one engine (spec §10). The engine object and its
@@ -159,6 +180,7 @@ class cam_endpoint {
   bool busy() const {
     return m_engine.scheduled_work() || !m_out.empty() || !m_in.empty();
   }
+  unsigned long long progress() const { return m_engine.progress(); }
   void print_stats(FILE *fp) const;
 
  private:
@@ -184,6 +206,9 @@ class cam_endpoint {
   // outbound window occupancy in wire bytes: from acceptance at the endpoint
   // until delivery into the engine input (spec §10, sweep 2)
   unsigned long long m_out_inflight_bytes = 0;
+  // inbound: result bytes on the link or waiting at the endpoint (F2)
+  unsigned long long m_rx_bytes = 0, n_peak_rx_bytes = 0, n_rx_blocks = 0;
+  bool m_rx_blocked = false;
   unsigned long long n_out_payload = 0, n_out_hdr = 0, n_in_payload = 0,
                      n_in_hdr = 0, n_peak_out_inflight_bytes = 0,
                      n_out_delivered = 0, occ_cycles_out = 0;

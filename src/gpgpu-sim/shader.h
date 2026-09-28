@@ -2832,6 +2832,8 @@ class shader_core_ctx : public core_t {
       m_cam_sub;
   std::vector<unsigned> m_cam_first_warp;
   std::map<unsigned long long, unsigned long long> m_cam_first_pkt;
+  // result packets received per search (F2 check: none lost or duplicated)
+  std::map<unsigned long long, std::set<unsigned>> m_cam_pkts_seen;
   bool warp_waiting_at_mem_barrier(unsigned warp_id);
   void set_max_cta(const kernel_info_t &kernel);
   void warp_inst_complete(const warp_inst_t &inst);

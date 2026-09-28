@@ -100,6 +100,7 @@ class mem_fetch {
     // placement path (spec §10): command at the GPU-side endpoint; this
     // packet's release by the engine and its arrival back at the endpoint
     unsigned long long t_endpoint = 0, t_last_ready = 0, t_last_ep = 0;
+    unsigned out_bytes = 0;  // result bytes held in the CAM output buffer (F2)
   } m_cam;
   std::shared_ptr<warp_inst_t> get_inst_ptr() const { return m_inst; }
 
