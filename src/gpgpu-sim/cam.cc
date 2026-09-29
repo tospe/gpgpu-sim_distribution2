@@ -763,7 +763,9 @@ void cam_endpoint::pull_cycle(unsigned long long now) {
         e.t_accept + m_config->dram_latency, now + m_config->dram_latency / 2);
     if (mf->m_cam.poll) {  // status read: sampled when the device serves it
       mf->m_cam.status_val =
-          m_status[std::make_pair(mf->get_sid(), mf->get_inst().m_cam_slot)];
+          m_status[std::make_pair(
+              m_config->cam_pull_status_global ? 0u : mf->get_sid(),
+              mf->get_inst().m_cam_slot)];
       mf->set_reply();
       m_ret.push_back(timed_mf{t_ret, mf, e.t_accept});
     } else if (mf->m_cam.valid) {  // query chunk, command, fill: into the
@@ -806,7 +808,8 @@ void cam_endpoint::pull_cycle(unsigned long long now) {
 // fill/write). Logged here; the SM logs when a poll observes it (P record).
 void cam_endpoint::pull_complete(mem_fetch *mf, unsigned long long now) {
   const warp_inst_t &inst = mf->get_inst();
-  m_status[std::make_pair(mf->get_sid(), inst.m_cam_slot)]++;
+  m_status[std::make_pair(m_config->cam_pull_status_global ? 0u : mf->get_sid(),
+                          inst.m_cam_slot)]++;
   n_pull_status_updates++;
   if (!m_log || !m_log->on()) return;
   if (inst.m_cam_op == CAM_OP_SEARCH) {

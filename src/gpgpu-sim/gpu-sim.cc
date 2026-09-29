@@ -373,6 +373,14 @@ void memory_config::reg_options(class OptionParser *opp) {
       "kernel launches (multi-kernel workloads). No timing effect",
       "0");
   option_parser_register(
+      opp, "-gpgpu_cam_pull_status_global", OPT_BOOL, &cam_pull_status_global,
+      "B-pull: 0 = status words keyed by (SM, slot) (legacy; valid while each "
+      "SM hosts one CTA using a slot for the whole run); 1 = one status word "
+      "per result buffer, the slot field naming a software-assigned buffer "
+      "(docs/option_b_pull_spec.md §3), so status survives CTA placement and "
+      "kernel boundaries only as the buffer's own sequence number",
+      "0");
+  option_parser_register(
       opp, "-gpgpu_cam_placement", OPT_UINT32, &cam_placement,
       "CAM placement: 0 on-chip (L2 side), 1 external link", "0");
   option_parser_register(

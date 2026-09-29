@@ -393,6 +393,7 @@ class memory_config {
   unsigned cam_readout_per_cycle;  // results selected per readout step (R)
   bool cam_strict_slots;           // enforce slot ownership rule
   bool cam_func_seq_across_launches;  // functional query identity (see option)
+  bool cam_pull_status_global;  // B-pull: status word per result buffer (see option)
   unsigned cam_placement;          // 0 on-chip, 1 external link
   double cam_link_latency_ns;      // one-way, per direction
   double cam_link_gbps;            // per direction; 0 = no serialization
